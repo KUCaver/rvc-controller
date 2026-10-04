@@ -1,0 +1,19 @@
+id,scenario,assertion_scope,test_suite
+SC01,Initialization,Stop then Off and four successful sensor samples,RobotTest
+SC02,All states and sensor combinations,6 reachable states times 16 FLRD inputs at decision boundaries,DecisionTest
+SC03,Obstacle priority,Right before left and backward if neither side is free,DecisionTest
+SC04,Dust change,Immediate normal cleaning on first false Tick without motor command,RobotTest
+SC05,Turn timer boundary,Entry zero and completion on fifth subsequent Tick,TimingTest
+SC06,Backward timer boundary,Completion on third subsequent Tick and no direct forward,TimingTest
+SC07,Repeated maneuver,New motor trigger and reset counter on repeated segment,TimingTest
+SC08,Output order,Off before avoidance only when cleaning was active,DecisionTest
+SC09,Output persistence,No duplicate writes while holding or unchanged forward mode,TimingTest
+SC10,Front reports,Report does not Tick and periodic Tick does not reread front,RobotTest
+SC11,Lifecycle,Create and destroy have no writes; shutdown and reinitialization contracts,RobotTest
+SC12,Instances,Independent input state elapsed Tick and command logs,RobotTest
+SC13,Initialization faults,All six callback failures and recovery,InitFailureTest
+SC14,Periodic sensor faults,Error then Off and Stop and latched not ready,TickReadFailureTest
+SC15,Output faults,Partial failures attempt both safe commands without invented success,RobotTest
+SC16,Module boundaries,Disable differs from Stop and invalid enums emit no outputs,RobotTest
+SC17,Invalid arguments,Null pointers and every missing callback,PublicArguments
+SC18,Mock contract,Failed reads preserve output and failed writes preserve hardware log,MockContract
