@@ -10,8 +10,7 @@ typedef enum {
     RVC_OK = 0,
     RVC_INVALID_ARGUMENT,
     RVC_NOT_READY,
-    RVC_NOT_IMPLEMENTED, /* 이전 골격의 예약 값. 현재 제품 실행 경로에서는 반환하지 않는다. */
-    RVC_IO_ERROR
+    RVC_IO_ERROR = 4 /* 사용하지 않는 예약 값을 제거하되 기존 오류 번호는 유지한다. */
 } RvcStatus;
 
 /* true=장애물 감지, false=미감지. 읽기 실패를 false로 표현하지 않는다. */

@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 #ifdef RVC_SINGLE_FILE
-#include "controller.h"
+#include "single_file_test_support.h"
 #else
 #include "rvc/rvc.h"
 #include "mock_device.h"

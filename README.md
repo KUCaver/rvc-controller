@@ -6,6 +6,8 @@
 
 **2026-10-06 파일 통합:** 교수님 안내에 맞춰 [single_file/controller.c](single_file/controller.c)와 [single_file/controller.h](single_file/controller.h)에 구현·선언을 합쳤다. 두 파일을 같은 폴더에 두고 `gcc -std=c17 controller.c -o rvc.exe`로 컴파일할 수 있다. Main과 모의 장치, 내장 시나리오까지 포함했다. [통합본 실행·구조 설명](single_file/README.md)을 먼저 참고한다. 아래의 여러 파일 구성은 유지보수용 개발본이다.
 
+**헤더 정리:** 공개 헤더에는 외부 함수 7개와 필요한 타입만 둔다. 내부 모듈·모의 장치 선언은 C 파일의 1절로 옮겨 읽는 범위를 줄였다. 하위 모듈 직접 검사를 위한 선언은 별도 시험 지원 헤더에서 관리한다. [정리 판단과 범위](docs/ADR-001-header-cleanup.md)를 참고한다.
+
 ## 내려받기
 
 ```sh

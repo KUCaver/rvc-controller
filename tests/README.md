@@ -4,7 +4,7 @@
 
 ## 실행과 근거
 
-2026-10-06부터 같은 테스트 본문을 모듈 분리본(`rvc_tests`)과 통합본(`rvc_single_tests`)에 각각 연결한다. 통합본은 `RVC_SINGLE_FILE`로 `single_file/controller.h`만 포함하고, `RVC_NO_MAIN`으로 CLI를 제외한 단일 C 구현에 링크한다. 각각 134개로, 서로 다른 시스템 시험 268개가 생긴 것은 아니다. 결과 XML은 `gtest.xml`과 `gtest_single.xml`이다.
+2026-10-06부터 같은 테스트 본문을 모듈 분리본(`rvc_tests`)과 통합본(`rvc_single_tests`)에 각각 연결한다. 통합본은 `RVC_SINGLE_FILE`로 `single_file_test_support.h`를 포함한다. 이 시험 전용 헤더는 공개 `single_file/controller.h`와 내부 모듈·모의 장치 선언을 제공한다. `RVC_NO_MAIN`으로 CLI를 제외한 단일 C 구현에 링크하며, 기존 core/mock 라이브러리는 연결하지 않는다. 각각 134개로, 서로 다른 시스템 시험 268개가 생긴 것은 아니다. 결과 XML은 `gtest.xml`과 `gtest_single.xml`이다.
 
 프로젝트 루트의 `build.ps1` 또는 CMake 테스트 타깃으로 빌드·실행한다. 실제 실행 성공 여부와 개수는 빌드 결과 및 GoogleTest 결과 파일을 확인한다. 이 문서의 시나리오 목록 자체는 실행 성공 기록이 아니다.
 

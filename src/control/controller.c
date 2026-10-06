@@ -67,8 +67,7 @@ RvcStatus rvc_controller_initialize(Rvc *self)
     self->telemetry.initialized = false;
     self->telemetry.state = RVC_STATE_UNINITIALIZED;
     self->telemetry.elapsed_ticks = 0;
-    self->front_valid = self->left_valid = false;
-    self->right_valid = self->dust_valid = false;
+    self->front_valid = false;
     self->forward_enabled = false;
     /* 최초 상태 진입의 명령이다. 아직 Tick은 아니며, STOP 실패 시에도 OFF는 시도한다. */
     RvcStatus motor = rvc_stop_motor(self);

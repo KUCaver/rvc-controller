@@ -1,6 +1,6 @@
 # 통합본 검증 — 2026-10-06
 
-제품 함수의 동작을 유지하면서 구현 파일 배치를 하나로 합쳤는지 검증했다. 환경은 Windows / MSYS2 UCRT64 / GCC·G++ 16.1.0이다.
+제품 함수의 동작을 유지하면서 구현 파일 배치를 하나로 합쳤는지 검증했다. 이후 공개·내부 선언을 정리한 버전으로 아래 검사를 다시 실행했다. 환경은 Windows / MSYS2 UCRT64 / GCC·G++ 16.1.0이다.
 
 | 검사 | 결과 |
 |---|---|
@@ -12,7 +12,17 @@
 | CLI·입력 이력 비교 | 아래 9개 사례 모두 통과 |
 | 통합본 최신 여부 | 생성 도구의 --check 통과 |
 
-통합본 테스트는 `single_file/controller.h`만 프로젝트 헤더로 사용하고, `RVC_NO_MAIN`으로 CLI를 제외한 통합 C 파일에 링크했다. 기존 core/mock 라이브러리는 링크하지 않았다. 제품은 C, 테스트 실행기는 C++로 컴파일했다.
+통합본 테스트는 공개 `single_file/controller.h`와 생성된 시험 전용 `tests/single_file_test_support.h`를 사용하고, `RVC_NO_MAIN`으로 CLI를 제외한 통합 C 파일에 링크했다. 기존 core/mock 라이브러리는 링크하지 않았다. 제품은 C, 테스트 실행기는 C++로 컴파일했다.
+
+## 공개 헤더 정리 결과
+
+| 항목 | 정리 전 | 정리 후 |
+|---|---:|---:|
+| 공개 헤더 줄 수(주석·공백 포함) | 314 | 99 |
+| 공개 헤더의 함수 선언 | 30 | 7 |
+| 독립 프로그램에 필요한 프로젝트 파일 | C 1개 + 헤더 1개 | C 1개 + 헤더 1개 |
+
+내부 모듈 18개·모의 장치 5개 함수의 선언을 공개 헤더에서 옮겼다. 함수 구현과 Structured Chart 호출 관계는 유지한다. 사용하지 않는 예약 오류 이름과 읽지 않는 센서 유효성 필드 3개를 제거했고, 기존 오류 번호와 실제 판단에 쓰이는 전방 캐시 표시는 보존했다. 테스트 본문은 포함 헤더만 바꿨으며 기대 상태·Command는 수정하지 않았다.
 
 ## 독립 실행 검사
 
@@ -34,7 +44,7 @@ gcc -std=c17 -Wall -Wextra -Wpedantic -Werror controller.c -o rvc.exe
 | --realtime-ms 0 | 오류 종료, 주기 범위 오류 |
 | 세 입력에 --realtime-ms 1 | 정상 종료, 센서·상태·Command 및 종료 순서 일치 |
 
-분리본과 통합본의 표준 출력·표준 오류·종료 코드를 비교했다. 두 실행이 똑같이 잘못된 경우를 줄이기 위해 정상/오류 종료, 초기·종료 명령, 입력 이력, 출력 예시도 별도로 확인했다.
+이번 재검사에서는 정리 전에 보관한 실행 파일(`2d5064d` 기준 분리본)과 정리 후 통합본의 표준 출력·표준 오류·종료 코드를 비교했다. 9개 사례 모두 일치했다. 두 실행이 똑같이 잘못된 경우를 줄이기 위해 정상/오류 종료, 초기·종료 명령, 입력 이력, 출력 예시도 별도로 확인했다.
 
 처음 비교 시 예전 PowerShell 출력 예시의 UTF-8 BOM을 CSV 내용으로 읽어 2개 골든 비교가 실패했다. 검증 도구가 BOM을 인코딩 표식으로 처리하도록 수정한 후 9개 모두 통과했다. 제품 코드나 기대 상태·Command를 이 실패에 맞춰 수정하지 않았다.
 
@@ -48,13 +58,15 @@ python tools/generate_single_file.py --check
 python tools/verify_single_file.py --gcc C:/msys64/ucrt64/bin/gcc.exe
 ```
 
-실행 근거는 로컬의 `results/gtest.xml`, `results/gtest_single.xml`, `results/implementation_check.json`과 `results/single_file/run-20261006T061207.029225Z/summary.json`에 기록했다. 재실행은 기존 독립 검사 기록을 덮지 않고 새 run 디렉터리를 만든다. 로그·실행 파일은 Git에 포함하지 않는다.
+실행 근거는 로컬의 `results/gtest.xml`, `results/gtest_single.xml`, `results/implementation_check.json`과 `results/single_file/run-20261006T065916.051381Z/summary.json`에 기록했다. 재실행은 기존 독립 검사 기록을 덮지 않고 새 run 디렉터리를 만든다. 로그·실행 파일은 Git에 포함하지 않는다.
+
+위 기본 명령은 현재 분리본과 비교한다. 이번 정리 전후 비교는 보관한 실행 파일을 `--reference review_cleanup_20261006/rvc_demo_before.exe`로 지정했다. 이 백업은 로컬 작업용에만 있으며 저장소를 새로 받은 환경에는 포함되지 않는다.
 
 검증된 파일의 SHA-256:
 
 ```text
-controller.c  7e1ed19fde53df4b78d64ef2d2885632602feed9067abea14d86c53697d3e3dd
-controller.h  2f9a38a029519daa31a43b190c73fe20c6122ff4a8a7c25b487d8327fa9fd1cc
+controller.c  6ebdb62c6a5435f1f92e22522105fb64787364268d5ef2bbc6a1450da6f0807c
+controller.h  b64dc44185af43642f36eadb06e1eb9f3ab6adb73dcb4c791fc24bf21df694b7
 ```
 
 134개는 모듈 검사와 제어 동작 검사의 합이다. 두 형식으로 두 번 실행했다고 별도 시스템 시나리오 268개로 세지 않는다. 위 9개 실행 검사는 소스 통합의 독립 실행성과 동작 보존을 확인한다. 최종 시스템 시험 보고서/PPT 작성, 다른 운영체제, 실제 하드웨어, 실시간 정확도 보증은 이번 작업 범위에 포함되지 않는다.

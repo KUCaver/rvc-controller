@@ -9,11 +9,8 @@ struct Rvc {
     RvcDevice device; /* 호출할 센서/출력 함수와 호출자 소유 context. */
     RvcTelemetry telemetry; /* 확정 상태·입력과 장치 쓰기 결과. get_telemetry는 이를 복사한다. */
     RvcSensorSnapshot sampled; /* 읽는 중인 센서 캐시. 아직 확정된 telemetry.sensors와 구별. */
-    /* valid 플래그가 false인 미확정/오류 캐시와 정상 미감지(측정값 false)를 구별하는 표시. */
+    /* 전면 센서 캐시가 유효하면 매 Tick에 다시 읽지 않고 이벤트로 갱신한 값을 사용한다. */
     bool front_valid;
-    bool left_valid;
-    bool right_valid;
-    bool dust_valid;
     bool forward_enabled; /* Enable/Disable 제어의 기록. 다음 상태를 선택하는 FSM 값은 아니다. */
 };
 #endif

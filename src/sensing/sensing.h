@@ -7,8 +7,9 @@ extern "C" {
 
 /* 센서 인터페이스의 내부 계약. 앱은 이 헤더 대신 rvc/rvc.h를 사용한다.
  * self는 로봇별 상태를 가리키며 NULL이면 INVALID_ARGUMENT을 반환한다.
- * sample/initialize는 장치 콜백을 호출하고, 성공 시 self->sampled와 valid를 갱신한다.
- * 콜백 누락은 INVALID_ARGUMENT, 장치 오류는 그대로 전달한다. 실패 시 valid=false.
+ * sample/initialize는 장치 콜백을 호출하고, 성공 시 self->sampled를 갱신한다.
+ * Front만 이벤트 캐시의 유효성을 front_valid로 기록한다. 나머지는 반환 상태로 성공을 판단한다.
+ * 콜백 누락은 INVALID_ARGUMENT, 장치 오류는 그대로 전달한다. 실패 시 측정값을 갱신하지 않는다.
  * bool 측정값(false 포함)과 RvcStatus 성공/실패는 서로 다른 정보다.
  * 이 함수들은 센서 값을 준비할 뿐, Controller의 FSM이나 출력을 결정하지 않는다.
  */

@@ -19,6 +19,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "controller.h"
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #ifndef RVC_NO_MAIN
@@ -37,8 +38,71 @@
 #endif
 
 /* ========================================================================
- * 1. 내부 객체 상태: 인스턴스별 캡슐화
+ * 1. 내부 선언과 객체 상태: 외부 앱에서 몰라도 되는 구현 상세
  * ======================================================================== */
+
+/* 내부 제어 타입: Structured Chart의 Enable/Disable과 청소 모드. */
+typedef enum { RVC_FORWARD_DISABLE, RVC_FORWARD_ENABLE } RvcForwardControl;
+typedef enum { RVC_CLEANING_OFF, RVC_CLEANING_ON, RVC_CLEANING_POWER1 } RvcCleaningMode;
+
+/* 내부 모듈: control */
+RvcStatus rvc_controller_initialize(Rvc *self);
+RvcStatus rvc_controller_tick(Rvc *self);
+RvcStatus rvc_controller_shutdown(Rvc *self);
+
+/* 내부 모듈: perception */
+RvcStatus rvc_determine_obstacles(Rvc *self, RvcObstacles *out);
+RvcStatus rvc_determine_dust(Rvc *self, bool *out);
+
+/* 내부 모듈: sensing */
+RvcStatus rvc_front_sensor_initialize(Rvc *self);
+RvcStatus rvc_front_sensor_report(Rvc *self, bool blocked);
+RvcStatus rvc_left_sensor_sample(Rvc *self);
+RvcStatus rvc_right_sensor_sample(Rvc *self);
+RvcStatus rvc_dust_sensor_sample(Rvc *self);
+
+/* 내부 모듈: actions */
+RvcStatus rvc_move_forward(Rvc *self, RvcForwardControl control);
+RvcStatus rvc_turn_left(Rvc *self);
+RvcStatus rvc_turn_right(Rvc *self);
+RvcStatus rvc_move_backward(Rvc *self);
+RvcStatus rvc_stop_motor(Rvc *self);
+RvcStatus rvc_set_cleaning(Rvc *self, RvcCleaningMode mode);
+
+/* 내부 모듈: interfaces */
+RvcStatus rvc_motor_apply(Rvc *self, RvcMotorCommand command);
+RvcStatus rvc_cleaner_apply(Rvc *self, RvcCleanerCommand command);
+
+/* 모의 장치: 입력 설정, 명령 로그, 오류 주입. 상태 판단은 Controller가 한다.
+ * 로그는 성공한 명령만 기록하고 counts는 실패한 시도도 포함한다. */
+enum { RVC_MOCK_MAX_EVENTS = 1024 };
+typedef enum { RVC_MOCK_MOTOR, RVC_MOCK_CLEANER } RvcMockEventKind;
+typedef struct {
+    RvcMockEventKind kind;
+    int command;
+} RvcMockEvent;
+typedef enum {
+    RVC_MOCK_READ_FRONT, RVC_MOCK_READ_LEFT, RVC_MOCK_READ_RIGHT,
+    RVC_MOCK_READ_DUST, RVC_MOCK_WRITE_MOTOR, RVC_MOCK_WRITE_CLEANER,
+    RVC_MOCK_OPERATION_COUNT
+} RvcMockOperation;
+typedef struct {
+    RvcSensorSnapshot inputs;
+    RvcMockEvent events[RVC_MOCK_MAX_EVENTS];
+    size_t event_count;
+    size_t read_counts[4];
+    size_t write_counts[2];
+    size_t fault_remaining[RVC_MOCK_OPERATION_COUNT];
+    RvcMotorCommand motor;
+    RvcCleanerCommand cleaner;
+    bool motor_valid;
+    bool cleaner_valid;
+} RvcMockDevice;
+void rvc_mock_init(RvcMockDevice *mock);
+RvcDevice rvc_mock_device(RvcMockDevice *mock);
+void rvc_mock_clear_events(RvcMockDevice *mock);
+void rvc_mock_set_inputs(RvcMockDevice *mock, RvcSensorSnapshot inputs);
+void rvc_mock_fail_next(RvcMockDevice *mock, RvcMockOperation operation, size_t count);
 
 /* C에서 내부 상태를 감추는 실제 객체 정의. 외부 앱은 이 헤더를 include하지 않는다.
  * 로봇마다 이 구조체 하나를 가지므로 센서·시간·장치가 다른 인스턴스와 섞이지 않는다.
@@ -48,11 +112,8 @@ struct Rvc {
     RvcDevice device; /* 호출할 센서/출력 함수와 호출자 소유 context. */
     RvcTelemetry telemetry; /* 확정 상태·입력과 장치 쓰기 결과. get_telemetry는 이를 복사한다. */
     RvcSensorSnapshot sampled; /* 읽는 중인 센서 캐시. 아직 확정된 telemetry.sensors와 구별. */
-    /* valid 플래그가 false인 미확정/오류 캐시와 정상 미감지(측정값 false)를 구별하는 표시. */
+    /* 전면 센서 캐시가 유효하면 매 Tick에 다시 읽지 않고 이벤트로 갱신한 값을 사용한다. */
     bool front_valid;
-    bool left_valid;
-    bool right_valid;
-    bool dust_valid;
     bool forward_enabled; /* Enable/Disable 제어의 기록. 다음 상태를 선택하는 FSM 값은 아니다. */
 };
 
@@ -196,8 +257,7 @@ RvcStatus rvc_controller_initialize(Rvc *self)
     self->telemetry.initialized = false;
     self->telemetry.state = RVC_STATE_UNINITIALIZED;
     self->telemetry.elapsed_ticks = 0;
-    self->front_valid = self->left_valid = false;
-    self->right_valid = self->dust_valid = false;
+    self->front_valid = false;
     self->forward_enabled = false;
     /* 최초 상태 진입의 명령이다. 아직 Tick은 아니며, STOP 실패 시에도 OFF는 시도한다. */
     RvcStatus motor = rvc_stop_motor(self);
@@ -423,20 +483,18 @@ RvcStatus rvc_front_sensor_report(Rvc *self, bool blocked)
  * 입력 self: 장치와 센서 캐시를 가진 인스턴스. 초기화와 매 Tick에 한 번 읽는다.
  * 출력: 성공한 blocked 값만 sampled.obstacles.left_blocked에 저장한다.
  * 반환: self/콜백 누락은 INVALID_ARGUMENT, 읽기 실패는 장치 상태, 성공은 OK.
- * false는 '장애물 없음'이다. left_valid를 읽기 전에 해제하고 성공 시에만 설정하여
- * 실패 후 남아 있는 이전 값을 정상적인 이번 Tick 입력으로 오인하지 않게 한다.
+ * false는 '장애물 없음'이다. 호출자는 반환 상태를 검사하고 성공한 값만 판단에 사용한다.
+ * 읽기 실패 시 이전 캐시가 남더라도 이번 Tick의 입력으로 확정하지 않는다.
  */
 RvcStatus rvc_left_sensor_sample(Rvc *self)
 {
     bool blocked = false;
     RvcStatus status;
     if (!self) return RVC_INVALID_ARGUMENT;
-    self->left_valid = false;
     if (!self->device.read_left) return RVC_INVALID_ARGUMENT;
     status = self->device.read_left(self->device.context, &blocked);
     if (status != RVC_OK) return status;
     self->sampled.obstacles.left_blocked = blocked;
-    self->left_valid = true;
     return RVC_OK;
 }
 
@@ -446,20 +504,18 @@ RvcStatus rvc_left_sensor_sample(Rvc *self)
  * 입력 self: 장치와 센서 캐시를 가진 인스턴스. 초기화와 매 Tick에 한 번 읽는다.
  * 출력: 성공한 blocked 값만 sampled.obstacles.right_blocked에 저장한다.
  * 반환: self/콜백 누락은 INVALID_ARGUMENT, 읽기 실패는 장치 상태, 성공은 OK.
- * false는 '장애물 없음'이다. right_valid를 읽기 전에 해제하고 성공 시에만 설정하여
- * 실패 후 남아 있는 이전 값을 정상적인 이번 Tick 입력으로 오인하지 않게 한다.
+ * false는 '장애물 없음'이다. 호출자는 반환 상태를 검사하고 성공한 값만 판단에 사용한다.
+ * 읽기 실패 시 이전 캐시가 남더라도 이번 Tick의 입력으로 확정하지 않는다.
  */
 RvcStatus rvc_right_sensor_sample(Rvc *self)
 {
     bool blocked = false;
     RvcStatus status;
     if (!self) return RVC_INVALID_ARGUMENT;
-    self->right_valid = false;
     if (!self->device.read_right) return RVC_INVALID_ARGUMENT;
     status = self->device.read_right(self->device.context, &blocked);
     if (status != RVC_OK) return status;
     self->sampled.obstacles.right_blocked = blocked;
-    self->right_valid = true;
     return RVC_OK;
 }
 
@@ -469,20 +525,18 @@ RvcStatus rvc_right_sensor_sample(Rvc *self)
  * 입력 self: 장치와 센서 캐시를 가진 인스턴스. 초기화와 매 Tick에 한 번 읽는다.
  * 출력: 성공한 detected 값만 sampled.dust_detected에 저장한다.
  * 반환: self/콜백 누락은 INVALID_ARGUMENT, 읽기 실패는 장치 상태, 성공은 OK.
- * detected=false는 '먼지 미감지'이며 I/O 오류가 아니다. dust_valid를 먼저 해제하고
- * 성공 시에만 설정한다. 청소 세기 결정이나 강화 유지시간 관리는 이 모듈의 일이 아니다.
+ * detected=false는 '먼지 미감지'이며 I/O 오류가 아니다. 호출자는 반환 상태를 검사하고
+ * 성공한 값만 판단에 사용한다. 청소 세기 결정이나 강화 유지시간 관리는 이 모듈의 일이 아니다.
  */
 RvcStatus rvc_dust_sensor_sample(Rvc *self)
 {
     bool detected = false;
     RvcStatus status;
     if (!self) return RVC_INVALID_ARGUMENT;
-    self->dust_valid = false;
     if (!self->device.read_dust) return RVC_INVALID_ARGUMENT;
     status = self->device.read_dust(self->device.context, &detected);
     if (status != RVC_OK) return status;
     self->sampled.dust_detected = detected;
-    self->dust_valid = true;
     return RVC_OK;
 }
 
