@@ -10,6 +10,9 @@
 #include <initializer_list>
 #include <string>
 #include <vector>
+#ifdef RVC_SINGLE_FILE
+#include "controller.h"
+#else
 #include "rvc/rvc.h"
 #include "mock_device.h"
 extern "C" {
@@ -17,6 +20,7 @@ extern "C" {
 #include "interfaces/interfaces.h"
 #include "perception/perception.h"
 }
+#endif
 
 namespace {
 /* F/L/R/D 순서의 테스트 입력을 만든다. 장애물 true는 막힘, dust true는 먼지 감지다. */

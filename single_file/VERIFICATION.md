@@ -1,0 +1,60 @@
+# 통합본 검증 — 2026-10-06
+
+제품 함수의 동작을 유지하면서 구현 파일 배치를 하나로 합쳤는지 검증했다. 환경은 Windows / MSYS2 UCRT64 / GCC·G++ 16.1.0이다.
+
+| 검사 | 결과 |
+|---|---|
+| 원래 소스 포함 범위 | C 18개, 헤더 10개를 통합 대상으로 확인 |
+| 통합본 독립 컴파일 | controller.c와 controller.h 두 파일만 빈 디렉터리에 복사해 C17 엄격 경고 옵션으로 성공 |
+| 모듈 분리본 GoogleTest | 134개 통과, 실패·오류 0 |
+| 통합본 GoogleTest | 동일한 134개 통과, 실패·오류 0 |
+| 기본 시나리오 출력 | 분리본·통합본·기존 출력 예시 일치 |
+| CLI·입력 이력 비교 | 아래 9개 사례 모두 통과 |
+| 통합본 최신 여부 | 생성 도구의 --check 통과 |
+
+통합본 테스트는 `single_file/controller.h`만 프로젝트 헤더로 사용하고, `RVC_NO_MAIN`으로 CLI를 제외한 통합 C 파일에 링크했다. 기존 core/mock 라이브러리는 링크하지 않았다. 제품은 C, 테스트 실행기는 C++로 컴파일했다.
+
+## 독립 실행 검사
+
+두 파일만 복사한 디렉터리에는 컴파일 직전 controller.c와 controller.h 외의 파일이 없었다. 프로젝트 include 경로와 환경변수도 추가하지 않았다.
+
+```sh
+gcc -std=c17 -Wall -Wextra -Wpedantic -Werror controller.c -o rvc.exe
+```
+
+| 사례 | 기대 및 확인 결과 |
+|---|---|
+| 옵션 없는 내장 시나리오 | 18 Tick, 초기 STOP/OFF, 종료 OFF/STOP, 기존 출력 예시 일치 |
+| demo.csv 입력 | 내장 시나리오와 동일한 센서·상태·Command 이력 |
+| 16개 센서 조합 8회 반복 | 128 Tick 입력 이력·연속 Tick·출력 전체가 분리본과 일치 |
+| 두 번째 데이터 행에 2 입력 | 오류 종료, 첫 유효 Tick 이후 OFF/STOP, 오류 줄 번호 일치 |
+| 빈 CSV | 오류 종료, 입력 없음 메시지, 출력 프레임 없음 |
+| 없는 CSV | 오류 종료, 파일 오류, 출력 프레임 없음 |
+| --help | 정상 종료, 옵션 설명 |
+| --realtime-ms 0 | 오류 종료, 주기 범위 오류 |
+| 세 입력에 --realtime-ms 1 | 정상 종료, 센서·상태·Command 및 종료 순서 일치 |
+
+분리본과 통합본의 표준 출력·표준 오류·종료 코드를 비교했다. 두 실행이 똑같이 잘못된 경우를 줄이기 위해 정상/오류 종료, 초기·종료 명령, 입력 이력, 출력 예시도 별도로 확인했다.
+
+처음 비교 시 예전 PowerShell 출력 예시의 UTF-8 BOM을 CSV 내용으로 읽어 2개 골든 비교가 실패했다. 검증 도구가 BOM을 인코딩 표식으로 처리하도록 수정한 후 9개 모두 통과했다. 제품 코드나 기대 상태·Command를 이 실패에 맞춰 수정하지 않았다.
+
+## 재현과 기록
+
+저장소 루트에서:
+
+```powershell
+.\build.ps1
+python tools/generate_single_file.py --check
+python tools/verify_single_file.py --gcc C:/msys64/ucrt64/bin/gcc.exe
+```
+
+실행 근거는 로컬의 `results/gtest.xml`, `results/gtest_single.xml`, `results/implementation_check.json`과 `results/single_file/run-20261006T061207.029225Z/summary.json`에 기록했다. 재실행은 기존 독립 검사 기록을 덮지 않고 새 run 디렉터리를 만든다. 로그·실행 파일은 Git에 포함하지 않는다.
+
+검증된 파일의 SHA-256:
+
+```text
+controller.c  7e1ed19fde53df4b78d64ef2d2885632602feed9067abea14d86c53697d3e3dd
+controller.h  2f9a38a029519daa31a43b190c73fe20c6122ff4a8a7c25b487d8327fa9fd1cc
+```
+
+134개는 모듈 검사와 제어 동작 검사의 합이다. 두 형식으로 두 번 실행했다고 별도 시스템 시나리오 268개로 세지 않는다. 위 9개 실행 검사는 소스 통합의 독립 실행성과 동작 보존을 확인한다. 최종 시스템 시험 보고서/PPT 작성, 다른 운영체제, 실제 하드웨어, 실시간 정확도 보증은 이번 작업 범위에 포함되지 않는다.

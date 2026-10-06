@@ -4,6 +4,8 @@
 
 ## 실행과 근거
 
+2026-10-06부터 같은 테스트 본문을 모듈 분리본(`rvc_tests`)과 통합본(`rvc_single_tests`)에 각각 연결한다. 통합본은 `RVC_SINGLE_FILE`로 `single_file/controller.h`만 포함하고, `RVC_NO_MAIN`으로 CLI를 제외한 단일 C 구현에 링크한다. 각각 134개로, 서로 다른 시스템 시험 268개가 생긴 것은 아니다. 결과 XML은 `gtest.xml`과 `gtest_single.xml`이다.
+
 프로젝트 루트의 `build.ps1` 또는 CMake 테스트 타깃으로 빌드·실행한다. 실제 실행 성공 여부와 개수는 빌드 결과 및 GoogleTest 결과 파일을 확인한다. 이 문서의 시나리오 목록 자체는 실행 성공 기록이 아니다.
 
 현재 테스트 구성은 134개다. 성공 여부는 직접 실행한 결과로 확인한다. Windows 빌드 스크립트는 `results/gtest.xml`에, 직접 CTest를 실행하면 빌드 폴더의 `gtest.xml`에 실제 결과를 저장한다.
@@ -26,7 +28,7 @@ $env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
 .\build\cmake\rvc_tests.exe '--gtest_filter=RobotTest.DustLossImmediatelyRestoresNormalCleaningWithoutMotorWrite'
 ```
 
-목록 조회는 검사를 실행하지 않는다. 선택 실행 결과는 전체 통과 결과로 해석하지 않는다. `build.ps1`이 전체 실행의 XML과 요약을 `results`에 저장한다. CTest의 `1/1`은 등록된 테스트 실행기 1개이며, 그 안에서 실제 GoogleTest 사례 134개가 실행된다.
+목록 조회는 검사를 실행하지 않는다. 선택 실행 결과는 전체 통과 결과로 해석하지 않는다. `build.ps1`이 전체 실행의 XML과 요약을 `results`에 저장한다. CTest에는 두 빌드 형식의 실행기 2개가 등록되며, 각각 GoogleTest 사례 134개를 실행한다.
 
 ## 입력 이력과 기대 결과 예시
 

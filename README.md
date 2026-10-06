@@ -4,6 +4,8 @@
 
 **Team Project #2의 구현 작업본**이다. SD Structured Chart와 시스템 시험 보고서를 담은 최종 PPT/PDF는 이 저장소에 포함되지 않는다. 설계 자료와 코드 사이에 남은 확인 사항은 [작업 상태](docs/STATUS.md)에 기록했다.
 
+**2026-10-06 파일 통합:** 교수님 안내에 맞춰 [single_file/controller.c](single_file/controller.c)와 [single_file/controller.h](single_file/controller.h)에 구현·선언을 합쳤다. 두 파일을 같은 폴더에 두고 `gcc -std=c17 controller.c -o rvc.exe`로 컴파일할 수 있다. Main과 모의 장치, 내장 시나리오까지 포함했다. [통합본 실행·구조 설명](single_file/README.md)을 먼저 참고한다. 아래의 여러 파일 구성은 유지보수용 개발본이다.
+
 ## 내려받기
 
 ```sh
