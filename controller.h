@@ -50,7 +50,7 @@ typedef enum {
 /* 확정된 상태와 출력의 조회용 복사본. 내부 상태를 수정하는 입력으로 사용하지 않는다. */
 typedef struct {
     RvcState state;
-    uint32_t elapsed_ticks; /* 회피 진입=0. 회전 5/후진 3번째 후속 Tick에서 재판단. */
+    uint32_t elapsed_ticks; /* 회피 진입=0. 회전은 5 Tick, 후진은 빈 방향 발견 시 즉시 전환. */
     RvcSensorSnapshot sensors; /* 마지막 성공한 초기화/Tick에서 확정한 입력. */
     RvcMotorCommand motor;
     RvcCleanerCommand cleaner;

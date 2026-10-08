@@ -30,9 +30,11 @@
  *   먼지 있음 F_POWER1(FORWARD, UP). UP은 강화 단계의 절대 설정이다.
  * - 앞이 막히면 우측 열림 RIGHT_OFF, 아니면 좌측 열림 LEFT_OFF,
  *   양쪽 모두 막힘 BACK_OFF. 각 상태의 명령은 RIGHT/LEFT/BACKWARD와 OFF이다.
- * - 회전은 5 Tick, 후진은 3 Tick 후 다시 판단한다. 진입 시 elapsed=0이며
- *   유지 Tick에는 센서를 갱신하되 기존 출력을 유지한다. 만료 시 최대 한 번 전이한다.
- * - 후진 만료 시에는 앞쪽과 무관하게 우회전 -> 좌회전 -> 재후진 순으로 선택한다.
+ * - 회전은 후속 5번째 Tick에 다시 판단한다. 진입 시 elapsed=0이다.
+ * - 후진 중에는 매 Tick 앞 -> 오른쪽 -> 왼쪽 순서로 빈 방향을 확인한다.
+ *   공간이 있으면 3 Tick을 기다리지 않고 그 Tick에 전진 또는 회전으로 전환한다.
+ *   모두 막혀 있으면 후진을 유지하고, 후속 3번째 Tick에 후진 구간을 다시 시작한다.
+ *   한 Tick에 전이는 최대 한 번이며, 전환한 회전의 시간은 elapsed=0부터 센다.
  * - 전진 중 먼지가 사라지면 다음 판단에서 ON으로 복귀한다. 추가 유지 타이머는 없다.
  * - 회피 진입은 필요 시 청소 OFF -> 방향 명령, 전진 진입은 FORWARD -> ON/UP 순서이다.
  *   같은 전진 상태/출력은 재전송하지 않으며 회피 재진입은 새 방향 명령을 보낸다.
@@ -252,12 +254,12 @@ RvcStatus rvc_controller_initialize(Rvc *self)
     return RVC_OK;
 }
 
-/* FSM 조건 판단: current와 input으로 다음 상태를 반환하며 장치 출력은 수행하지 않는다.
- * 회피 유지 구간을 제외한 Tick에서 호출한다. 후진 만료는 우측 -> 좌측 -> 재후진 우선이다. */
-static RvcState select_next_state(RvcState current, const RvcSensorSnapshot *input)
+/* FSM 조건 판단: input으로 다음 상태를 반환하며 장치 출력은 수행하지 않는다.
+ * 앞이 열리면 전진, 아니면 오른쪽 -> 왼쪽 -> 후진 순서로 선택한다. */
+static RvcState select_next_state(const RvcSensorSnapshot *input)
 {
     const RvcObstacles *o = &input->obstacles;
-    if (current == RVC_STATE_BACK_OFF || o->front_blocked) {
+    if (o->front_blocked) {
         if (!o->right_blocked) return RVC_STATE_RIGHT_OFF;
         if (!o->left_blocked) return RVC_STATE_LEFT_OFF;
         return RVC_STATE_BACK_OFF;
@@ -328,10 +330,13 @@ RvcStatus rvc_controller_tick(Rvc *self)
     RvcState current = self->telemetry.state;
     if (is_maneuver(current)) {
 
-        /* 회전: 1~4 유지, 5에서 재판단. 후진: 1~2 유지, 3에서 재판단. */
+        /* 회전은 5 Tick까지 유지한다. 후진은 공간이 생기면 시간보다 회피를 우선한다. */
         uint32_t elapsed = self->telemetry.elapsed_ticks + 1U;
         uint32_t duration = current == RVC_STATE_BACK_OFF ? REVERSE_TICKS : TURN_TICKS;
-        if (elapsed < duration) {
+        bool reverse_exit_open = current == RVC_STATE_BACK_OFF &&
+            (!input.obstacles.front_blocked || !input.obstacles.left_blocked ||
+             !input.obstacles.right_blocked);
+        if (elapsed < duration && !reverse_exit_open) {
 
             self->telemetry.elapsed_ticks = elapsed;
             self->telemetry.sensors = input;
@@ -341,7 +346,7 @@ RvcStatus rvc_controller_tick(Rvc *self)
         return fail_closed(self, RVC_INVALID_ARGUMENT);
     }
 
-    RvcState next = select_next_state(current, &input);
+    RvcState next = select_next_state(&input);
     result = apply_transition(self, next);
     if (result != RVC_OK) return fail_closed(self, result);
 
@@ -819,7 +824,7 @@ int main(int argc, char **argv)
         }
     }
 
-    /* 전진, 청소 강화, 우회전, 후진, 좌회전과 복귀를 관찰하는 입력 시나리오. */
+    /* 전진, 청소 강화, 우회전, 후진 중 앞쪽 개방에 따른 즉시 전진을 관찰한다. */
     static const RvcSensorSnapshot builtin[] = {
         {{0,0,0},0}, {{0,0,0},1}, {{0,0,0},0},
         {{1,0,0},1}, {{0,0,0},0}, {{0,0,0},0}, {{0,0,0},0},
