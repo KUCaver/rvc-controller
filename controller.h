@@ -41,6 +41,7 @@ typedef enum {
     RVC_CLEANER_OFF, RVC_CLEANER_ON, RVC_CLEANER_UP
 } RvcCleanerCommand;
 /* 동작 상태: F_ON/F_POWER1=전진 및 일반/강화 청소, 회피 상태에서는 청소 OFF.
+ * 강화는 마지막 먼지 감지 후 3번째 Tick에 해제한다. 재감지 시 연장, 회피 시 취소.
  * UNINITIALIZED는 초기화 전·종료·장치 오류 후의 API 준비 상태다. */
 typedef enum {
     RVC_STATE_UNINITIALIZED,

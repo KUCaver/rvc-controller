@@ -26,8 +26,8 @@
  *
  * 본 구현에서 채택한 FSM/시간 정책:
  * - 초기 상태 STOP_OFF: STOP, OFF 순서로 출력한 뒤 센서 입력을 확보한다.
- * - 정지/전진 판단: 앞이 열리면 먼지 없음 F_ON(FORWARD, ON),
- *   먼지 있음 F_POWER1(FORWARD, UP). UP은 강화 단계의 절대 설정이다.
+ * - 앞이 열린 전진 판단: 먼지 감지 또는 강화 유지 중이면 F_POWER1(FORWARD, UP),
+ *   그 외에는 F_ON(FORWARD, ON). UP은 강화 단계의 절대 설정이다.
  * - 앞이 막히면 우측 열림 RIGHT_OFF, 아니면 좌측 열림 LEFT_OFF,
  *   양쪽 모두 막힘 BACK_OFF. 각 상태의 명령은 RIGHT/LEFT/BACKWARD와 OFF이다.
  * - 회전은 후속 5번째 Tick에 다시 판단한다. 진입 시 elapsed=0이다.
@@ -35,7 +35,10 @@
  *   공간이 있으면 3 Tick을 기다리지 않고 그 Tick에 전진 또는 회전으로 전환한다.
  *   모두 막혀 있으면 후진을 유지하고, 후속 3번째 Tick에 후진 구간을 다시 시작한다.
  *   한 Tick에 전이는 최대 한 번이며, 전환한 회전의 시간은 elapsed=0부터 센다.
- * - 전진 중 먼지가 사라지면 다음 판단에서 ON으로 복귀한다. 추가 유지 타이머는 없다.
+ * - 전진 중 먼지를 감지하면 강화 만료까지 남은 Tick을 3으로 갱신한다.
+ *   마지막 감지를 t=0이라 할 때 미감지 t=1,2에는 UP, t=3에는 ON으로 복귀한다.
+ *   재감지는 만료보다 우선한다. 회피 진입/초기화/종료/오류 시 유지 시간을 취소한다.
+ *   회피 중 먼지는 기억하지 않으며 전진 복귀 Tick의 감지값으로 새로 판단한다.
  * - 회피 진입은 필요 시 청소 OFF -> 방향 명령, 전진 진입은 FORWARD -> ON/UP 순서이다.
  *   같은 전진 상태/출력은 재전송하지 않으며 회피 재진입은 새 방향 명령을 보낸다.
  * - Controller가 논리 Tick을 관리하고 Main이 호출 주기와 대기를 담당한다.
@@ -116,6 +119,7 @@ struct Rvc {
 
     bool front_valid; /* 전방 이벤트 캐시의 유효성 */
     bool forward_enabled; /* Structured Chart의 Enable/Disable 기록 */
+    uint32_t dust_hold_ticks; /* 강화 만료까지 남은 Tick(0~3). 회피 시간과 독립이다. */
 };
 
 /* 2. 공개 API */
@@ -183,7 +187,7 @@ RvcStatus rvc_get_telemetry(const Rvc *self, RvcTelemetry *out)
 
 /* 3. Controller 2.1.1: 상태 전이와 Command 결정 */
 /* 회피 진입은 elapsed=0. 단위는 후속 논리 Tick 수이다. */
-enum { TURN_TICKS = 5, REVERSE_TICKS = 3 };
+enum { TURN_TICKS = 5, REVERSE_TICKS = 3, DUST_HOLD_TICKS = 3 };
 
 /* 상태 분류: s가 전진 상태(F_ON 또는 F_POWER1)인지 반환한다. */
 static bool is_forward(RvcState s)
@@ -220,6 +224,7 @@ RvcStatus rvc_controller_shutdown(Rvc *self)
     self->telemetry.state = RVC_STATE_UNINITIALIZED;
     self->telemetry.elapsed_ticks = 0;
     self->forward_enabled = false;
+    self->dust_hold_ticks = 0;
     return clean != RVC_OK ? clean : motor;
 }
 
@@ -240,6 +245,7 @@ RvcStatus rvc_controller_initialize(Rvc *self)
     self->telemetry.elapsed_ticks = 0;
     self->front_valid = false;
     self->forward_enabled = false;
+    self->dust_hold_ticks = 0;
 
     RvcStatus motor = rvc_stop_motor(self);
     RvcStatus clean = rvc_set_cleaning(self, RVC_CLEANING_OFF);
@@ -254,9 +260,9 @@ RvcStatus rvc_controller_initialize(Rvc *self)
     return RVC_OK;
 }
 
-/* FSM 조건 판단: input으로 다음 상태를 반환하며 장치 출력은 수행하지 않는다.
- * 앞이 열리면 전진, 아니면 오른쪽 -> 왼쪽 -> 후진 순서로 선택한다. */
-static RvcState select_next_state(const RvcSensorSnapshot *input)
+/* FSM 조건 판단: input과 이번 Tick의 강화 여부로 다음 상태를 반환한다.
+ * 앞이 열리면 전진, 아니면 오른쪽 -> 왼쪽 -> 후진. 장치 출력은 수행하지 않는다. */
+static RvcState select_next_state(const RvcSensorSnapshot *input, bool boost)
 {
     const RvcObstacles *o = &input->obstacles;
     if (o->front_blocked) {
@@ -265,7 +271,7 @@ static RvcState select_next_state(const RvcSensorSnapshot *input)
         return RVC_STATE_BACK_OFF;
     }
 
-    return input->dust_detected ? RVC_STATE_F_POWER1 : RVC_STATE_F_ON;
+    return boost ? RVC_STATE_F_POWER1 : RVC_STATE_F_ON;
 }
 
 /* FSM 출력 연결: next에 대응하는 이동 모듈을 호출하고 그 처리 상태를 반환한다.
@@ -346,7 +352,14 @@ RvcStatus rvc_controller_tick(Rvc *self)
         return fail_closed(self, RVC_INVALID_ARGUMENT);
     }
 
-    RvcState next = select_next_state(&input);
+    /* 전진 가능한 Tick만 강화 시간을 갱신한다. 감지는 만료보다 우선하며,
+     * 회피에서는 0으로 취소한다. 출력 성공 전까지 객체의 카운터를 확정하지 않는다. */
+    uint32_t dust_hold_ticks = 0;
+    if (!input.obstacles.front_blocked) {
+        if (input.dust_detected) dust_hold_ticks = DUST_HOLD_TICKS;
+        else if (self->dust_hold_ticks > 0) dust_hold_ticks = self->dust_hold_ticks - 1U;
+    }
+    RvcState next = select_next_state(&input, dust_hold_ticks > 0);
     result = apply_transition(self, next);
     if (result != RVC_OK) return fail_closed(self, result);
 
@@ -354,6 +367,7 @@ RvcStatus rvc_controller_tick(Rvc *self)
     self->telemetry.state = next;
     self->telemetry.elapsed_ticks = 0;
     self->telemetry.sensors = input;
+    self->dust_hold_ticks = dust_hold_ticks;
     return RVC_OK;
 }
 
