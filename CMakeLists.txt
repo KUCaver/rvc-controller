@@ -60,3 +60,29 @@ if(BUILD_TESTING)
   endforeach()
   add_test(NAME rvc.single_file.behavior COMMAND rvc_single_tests --gtest_output=xml:gtest_single.xml)
 endif()
+
+# Per-case CTest entries for IDE test explorers (e.g. VS Code CMake Tools Testing panel).
+# Appended only: the whole-executable tests above stay as they are for build.ps1.
+if(BUILD_TESTING)
+  include(GoogleTest)
+  gtest_discover_tests(rvc_tests TEST_PREFIX "module.")
+  gtest_discover_tests(rvc_single_tests TEST_PREFIX "single_file.")
+
+  # Black-box system tests: public API + mock device only (no src/ include path).
+  add_executable(rvc_system_tests tests/system/rvc_system_tests.cpp)
+  target_link_libraries(rvc_system_tests PRIVATE rvc_core rvc_mock GTest::gtest_main)
+  # Same test body against the combined single-file implementation.
+  add_executable(rvc_single_system_tests tests/system/rvc_system_tests.cpp)
+  target_compile_definitions(rvc_single_system_tests PRIVATE RVC_SINGLE_FILE)
+  target_include_directories(rvc_single_system_tests PRIVATE tests)
+  target_link_libraries(rvc_single_system_tests PRIVATE rvc_single_core GTest::gtest_main)
+  foreach(target rvc_system_tests rvc_single_system_tests)
+    if(MSVC)
+      target_compile_options(${target} PRIVATE /W4 /WX)
+    else()
+      target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    endif()
+  endforeach()
+  gtest_discover_tests(rvc_system_tests TEST_PREFIX "system.")
+  gtest_discover_tests(rvc_single_system_tests TEST_PREFIX "single_file.system.")
+endif()
