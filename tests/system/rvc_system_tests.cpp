@@ -29,8 +29,14 @@
  *   H-FRONT    rvc_report_front: 전방 캐시만 갱신, 명령은 다음 Tick에서 결정.
  *              RvcDevice.read_front는 초기 읽기 전용
  * (POL-8 "Controller가 논리 Tick을 관리"는 시간 진행 방식 자체로, 모든 테스트가 따른다.)
+ *
+ * 구성: A 결정표, B 먼지, C 유지 시간, D 수명주기·오류, E 특이 케이스,
+ *       F 입력 변화 전수·무작위 비교(SpecModel = 위 POL 문장만으로 만든 기대값 모델. 제품 코드를 호출하지 않음).
  */
 #include <gtest/gtest.h>
+#include <cstdint>
+#include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 #include "controller.h"
@@ -635,5 +641,614 @@ TEST_F(RvcSystemTest, MotorWriteFailureOnAvoidanceTurnsOffAndStopsThenLocks)
     EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "C:OFF", "M:STOP"}));
     ExpectLocked();
 }
+
+/* ===================================================================== */
+/* E. 특이 케이스                                                         */
+/* ===================================================================== */
+
+/* --- E-1 전방 보고(값이 바뀔 때 / 안 바뀔 때) --- */
+
+/* REQ: H-FRONT — 전방 센서 값이 바뀌어도 보고가 없으면 반영하지 않는다. 보고하면 다음 Tick에 반영. */
+TEST_F(RvcSystemTest, FrontChangeWithoutReportIsNotUsed)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    dev.inputs = In(1, 0, 0);                  /* 장치 값만 바뀜, 보고 없음 */
+    EXPECT_EQ(rvc_tick(robot), RVC_OK);
+    EXPECT_EQ(TakeOutputs(), Outputs{});       /* 여전히 전진 */
+    EXPECT_EQ(rvc_report_front(robot, true), RVC_OK);
+    reported_front = true;
+    EXPECT_EQ(rvc_tick(robot), RVC_OK);
+    EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:RIGHT"}));
+}
+
+/* REQ: H-FRONT — 같은 값을 여러 번 보고해도 출력이 생기지 않고 동작도 바뀌지 않는다. */
+TEST_F(RvcSystemTest, RepeatedSameFrontReportChangesNothing)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(rvc_report_front(robot, false), RVC_OK);
+    EXPECT_EQ(TakeOutputs(), Outputs{});
+    EXPECT_EQ(Step(kClear), Outputs{});
+}
+
+/* REQ: H-FRONT(해석) — Tick 사이에 여러 번 보고되면 캐시에는 마지막 값이 남는다.
+ * 명세는 "캐시만 갱신"까지만 적고 있어 마지막 값 사용은 해석이다(보고서 확인 요청 항목). */
+TEST_F(RvcSystemTest, LastFrontReportBeforeTickWins)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    dev.inputs = kClear;
+    EXPECT_EQ(rvc_report_front(robot, true), RVC_OK);
+    EXPECT_EQ(rvc_report_front(robot, false), RVC_OK);   /* 막힘 → 열림 */
+    EXPECT_EQ(rvc_tick(robot), RVC_OK);
+    EXPECT_EQ(TakeOutputs(), Outputs{});
+    dev.inputs = In(1, 0, 0);
+    EXPECT_EQ(rvc_report_front(robot, false), RVC_OK);
+    EXPECT_EQ(rvc_report_front(robot, true), RVC_OK);    /* 열림 → 막힘 */
+    reported_front = true;
+    EXPECT_EQ(rvc_tick(robot), RVC_OK);
+    EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:RIGHT"}));
+}
+
+/* REQ: H-FRONT — 초기화 전 전방 보고는 NOT_READY이고 출력이 없다. */
+TEST_F(RvcSystemTest, FrontReportBeforeInitializationIsRejected)
+{
+    EXPECT_EQ(rvc_report_front(robot, true), RVC_NOT_READY);
+    EXPECT_EQ(TakeOutputs(), Outputs{});
+}
+
+/* REQ: H-FRONT, POL-3 — 초기화 때 이미 앞이 막혀 있으면(초기 읽기 값) 첫 Tick에 회피한다. */
+TEST_F(RvcSystemTest, FrontBlockedAtInitializationIsUsedOnFirstTick)
+{
+    EXPECT_EQ(PowerOn(In(1, 0, 0)), Outputs({"M:STOP", "C:OFF"}));
+    EXPECT_EQ(Step(In(1, 0, 0)), Outputs({"M:RIGHT"}));
+}
+
+/* REQ: POL-4 — 회전 유지 중 전방 보고가 바뀌어도 출력 없음, 만료 Tick에 마지막 값으로 판단. */
+TEST_F(RvcSystemTest, FrontReportsDuringTurnHoldAreUsedOnlyAtExpiry)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    ASSERT_EQ(Step(In(1, 0, 0)), Outputs({"C:OFF", "M:RIGHT"}));
+    EXPECT_EQ(Step(In(0, 0, 0)), Outputs{});
+    EXPECT_EQ(Step(In(1, 0, 0)), Outputs{});
+    EXPECT_EQ(Step(In(0, 0, 0)), Outputs{});
+    EXPECT_EQ(Step(In(1, 1, 0)), Outputs{});
+    EXPECT_EQ(Step(In(1, 1, 0)), Outputs({"M:RIGHT"}));  /* 만료: 앞 막힘, 오른쪽 열림 */
+}
+
+/* --- E-2 값이 오래 안 바뀔 때 --- */
+
+/* REQ: POL-7 — 같은 입력이 계속되면 전진 중 출력은 한 번도 다시 나가지 않는다(100 Tick). */
+TEST_F(RvcSystemTest, SteadyClearInputProducesNoOutputFor100Ticks)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    ExpectHold(100, kClear);
+}
+
+/* REQ: POL-6, POL-7 — 먼지가 계속 감지되면 UP을 유지하고 다시 보내지 않는다(100 Tick). */
+TEST_F(RvcSystemTest, SteadyDustKeepsBoostWithoutResendFor100Ticks)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardPower));
+    ExpectHold(100, In(0, 0, 0, 1));
+    EXPECT_EQ(Step(kClear), Outputs{});
+    EXPECT_EQ(Step(kClear), Outputs{});
+    EXPECT_EQ(Step(kClear), Outputs({"C:ON"}));
+}
+
+/* REQ: POL-5, POL-7 — 세 방향이 99 Tick 동안 막혀 있으면 3 Tick마다 BACKWARD만 다시 나간다(33회). */
+TEST_F(RvcSystemTest, AllBlockedFor99TicksRestartsBackwardEveryThirdTick)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::BackwardTick1));
+    int restarts = 0;
+    for (int tick = 1; tick <= 99; ++tick) {
+        const Outputs out = Step(kAllBlocked);
+        if (tick % 3 == 0) {
+            EXPECT_EQ(out, Outputs({"M:BACKWARD"})) << "tick " << tick;
+            ++restarts;
+        } else {
+            EXPECT_EQ(out, Outputs{}) << "tick " << tick;
+        }
+    }
+    EXPECT_EQ(restarts, 33);
+}
+
+/* --- E-3 경계가 겹칠 때 --- */
+
+/* REQ: POL-5, POL-6 — 후진 중 앞이 열리고 먼지가 있으면 바로 FORWARD + UP. */
+TEST_F(RvcSystemTest, BackwardExitToForwardWithDustBoostsImmediately)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::BackwardTick1));
+    EXPECT_EQ(Step(In(0, 1, 1, 1)), Outputs({"M:FORWARD", "C:UP"}));
+}
+
+/* REQ: POL-3, POL-6 — 강화 해제 Tick(t=3)에 장애물이 오면 회피가 우선하고, 강화는 취소된다. */
+TEST_F(RvcSystemTest, ObstacleOnBoostExpiryTickAvoidsAndCancelsBoost)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    ASSERT_EQ(Step(In(0, 0, 0, 1)), Outputs({"C:UP"}));
+    ExpectHold(2, kClear);
+    EXPECT_EQ(Step(In(1, 0, 0)), Outputs({"C:OFF", "M:RIGHT"}));
+    ExpectHold(4, kClear);
+    EXPECT_EQ(Step(kClear), Outputs({"M:FORWARD", "C:ON"}));
+}
+
+/* REQ: POL-6 — 강화 유지 중(t=1)에 먼지가 다시 사라졌다 나타났다 해도 UP을 다시 보내지 않는다. */
+TEST_F(RvcSystemTest, DustFlickeringDuringBoostSendsNothing)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    ASSERT_EQ(Step(In(0, 0, 0, 1)), Outputs({"C:UP"}));
+    for (int i = 0; i < 10; ++i) EXPECT_EQ(Step(In(0, 0, 0, i % 2)), Outputs{}) << "tick " << i;
+}
+
+/* REQ: POL-4, POL-3 — 회전 만료에 반대 방향을 고르면 그 방향 명령만 나간다(청소는 이미 OFF). */
+TEST_F(RvcSystemTest, TurnExpiryCanSwitchDirection)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::RightTurnExpiry));
+    EXPECT_EQ(Step(In(1, 0, 1)), Outputs({"M:LEFT"}));
+    ExpectHold(4, In(1, 0, 1));
+    EXPECT_EQ(Step(In(1, 1, 1)), Outputs({"M:BACKWARD"}));
+}
+
+/* REQ: POL-3, POL-7 — 앞이 Tick마다 막힘/열림을 반복해도 회전 유지는 깨지지 않는다. */
+TEST_F(RvcSystemTest, FrontTogglingEveryTickDoesNotBreakTurnHold)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE(round);
+        EXPECT_EQ(Step(In(1, 0, 0)), round == 0 ? Outputs({"C:OFF", "M:RIGHT"}) : Outputs({"M:RIGHT"}));
+        EXPECT_EQ(Step(In(0, 0, 0)), Outputs{});
+        EXPECT_EQ(Step(In(1, 0, 0)), Outputs{});
+        EXPECT_EQ(Step(In(0, 0, 0)), Outputs{});
+        EXPECT_EQ(Step(In(1, 0, 0)), Outputs{});
+    }
+    EXPECT_EQ(Step(kClear), Outputs({"M:FORWARD", "C:ON"}));
+}
+
+/* --- E-4 수명주기 특이 순서 --- */
+
+/* REQ: H-INIT, POL-6 — 동작 중 종료 없이 다시 초기화하면 STOP, OFF 후 강화 유지가 취소된다. */
+TEST_F(RvcSystemTest, ReinitializeWhileRunningResetsOutputsAndBoost)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardPower));
+    EXPECT_EQ(PowerOn(), Outputs({"M:STOP", "C:OFF"}));
+    EXPECT_EQ(Step(kClear), Outputs({"M:FORWARD", "C:ON"}));
+}
+
+/* REQ: H-INIT, POL-4 — 회전 중 다시 초기화하면 회전 시간도 초기화되어 다음 Tick에 바로 판단한다. */
+TEST_F(RvcSystemTest, ReinitializeDuringTurnResetsTimer)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    ASSERT_EQ(Step(In(1, 0, 0)), Outputs({"C:OFF", "M:RIGHT"}));
+    EXPECT_EQ(PowerOn(), Outputs({"M:STOP", "C:OFF"}));
+    EXPECT_EQ(Step(kClear), Outputs({"M:FORWARD", "C:ON"}));
+}
+
+/* REQ: H-SHUTDOWN — 초기화 전에 종료해도 OFF, STOP을 시도하고 이후 Tick은 거부된다. */
+TEST_F(RvcSystemTest, ShutdownBeforeInitializationStillCommandsOffThenStop)
+{
+    EXPECT_EQ(rvc_shutdown(robot), RVC_OK);
+    EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:STOP"}));
+    ExpectLocked();
+}
+
+/* REQ: H-SHUTDOWN — 종료를 두 번 호출해도 매번 OFF, STOP을 시도한다. */
+TEST_F(RvcSystemTest, ShutdownTwiceCommandsOffThenStopEachTime)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    EXPECT_EQ(rvc_shutdown(robot), RVC_OK);
+    EXPECT_EQ(rvc_shutdown(robot), RVC_OK);
+    EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:STOP", "C:OFF", "M:STOP"}));
+}
+
+/* REQ: H-SHUTDOWN — 종료 중 청소 OFF가 실패해도 STOP은 시도하고 오류를 돌려준다. */
+TEST_F(RvcSystemTest, ShutdownWithCleanerFailureStillStopsAndReportsError)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    dev.fail_next[kWriteCleaner] = 1;
+    EXPECT_EQ(rvc_shutdown(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeOutputs(), Outputs({"M:STOP"}));
+    ExpectLocked();
+}
+
+/* REQ: H-SHUTDOWN — 종료 중 STOP이 실패해도 OFF는 나가고 오류를 돌려준다. */
+TEST_F(RvcSystemTest, ShutdownWithMotorFailureStillTurnsOffAndReportsError)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    dev.fail_next[kWriteMotor] = 1;
+    EXPECT_EQ(rvc_shutdown(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF"}));
+    ExpectLocked();
+}
+
+/* REQ: H-SHUTDOWN, H-INIT — 해제(destroy)는 장치에 아무 명령도 보내지 않는다. */
+TEST_F(RvcSystemTest, DestroyWithoutShutdownSendsNothing)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    rvc_destroy(robot);
+    robot = nullptr;
+    EXPECT_EQ(TakeOutputs(), Outputs{});
+}
+
+/* --- E-5 오류가 겹칠 때 --- */
+
+/* REQ: POL-9 — 회피 OFF와 오류 처리 OFF가 모두 실패해도 STOP은 시도하고 잠긴다. */
+TEST_F(RvcSystemTest, PersistentCleanerFailureStillStopsMotor)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    dev.inputs = In(1, 0, 0);
+    ReportFrontIfChanged(In(1, 0, 0));
+    dev.fail_next[kWriteCleaner] = 2;
+    EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeOutputs(), Outputs({"M:STOP"}));
+    ExpectLocked();
+}
+
+/* REQ: POL-9 — 회전 유지 중 센서 읽기가 실패해도 OFF, STOP 후 잠긴다. */
+TEST_F(RvcSystemTest, SensorFailureDuringTurnHoldStopsAndLocks)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    ASSERT_EQ(Step(In(1, 0, 0)), Outputs({"C:OFF", "M:RIGHT"}));
+    ExpectHold(2, kClear);
+    dev.fail_next[kReadRight] = 1;
+    EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:STOP"}));
+    ExpectLocked();
+}
+
+/* REQ: POL-9 — 후진 중 센서 읽기가 실패해도 OFF, STOP 후 잠긴다. */
+TEST_F(RvcSystemTest, SensorFailureDuringBackwardStopsAndLocks)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::BackwardTick1));
+    dev.fail_next[kReadDust] = 1;
+    EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:STOP"}));
+    ExpectLocked();
+}
+
+/* REQ: POL-9 — 강화(UP) 쓰기가 실패하면 OFF, STOP 후 잠긴다. */
+TEST_F(RvcSystemTest, BoostWriteFailureStopsAndLocks)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    dev.inputs = In(0, 0, 0, 1);
+    dev.fail_next[kWriteCleaner] = 1;
+    EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:STOP"}));
+    ExpectLocked();
+}
+
+/* REQ: POL-9 — 정지 상태에서 FORWARD 쓰기가 실패하면 ON은 보내지 않고 OFF, STOP 후 잠긴다. */
+TEST_F(RvcSystemTest, ForwardWriteFailureStopsAndLocks)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::StopOff));
+    dev.inputs = kClear;
+    dev.fail_next[kWriteMotor] = 1;
+    EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:STOP"}));
+    ExpectLocked();
+}
+
+/* REQ: POL-9, H-INIT — Tick 오류로 잠긴 뒤 다시 초기화하면 정상 동작을 재개한다. */
+TEST_F(RvcSystemTest, RecoveryAfterTickErrorByReinitialization)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardPower));
+    dev.fail_next[kReadLeft] = 1;
+    EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    TakeOutputs();
+    ExpectLocked();
+    EXPECT_EQ(PowerOn(), Outputs({"M:STOP", "C:OFF"}));
+    EXPECT_EQ(Step(kClear), Outputs({"M:FORWARD", "C:ON"}));
+}
+
+/* REQ: H-INIT — 고장이 계속되면 초기화도 계속 실패하고, 고장이 사라지면 성공한다. */
+TEST_F(RvcSystemTest, InitializationKeepsFailingWhileFaultPersists)
+{
+    dev.fail_next[kReadLeft] = 3;
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(rvc_initialize(robot), RVC_IO_ERROR) << "attempt " << i + 1;
+        TakeOutputs();
+        ExpectLocked();
+    }
+    EXPECT_EQ(PowerOn(), Outputs({"M:STOP", "C:OFF"}));
+}
+
+/* --- E-6 API 인자와 여러 대 --- */
+
+/* REQ: controller.h 각 함수 주석 — NULL 인자와 빠진 콜백은 거부되고 장치 명령이 나가지 않는다. */
+TEST(RvcApiEdgeCases, NullArgumentsAndMissingCallbacksAreRejected)
+{
+    FakeDevice dev;
+    EXPECT_EQ(rvc_create(nullptr), nullptr);
+    const RvcDevice full = {&dev, ReadFront, ReadLeft, ReadRight, ReadDust, WriteMotor, WriteCleaner};
+    for (int missing = 0; missing < 6; ++missing) {
+        RvcDevice d = full;
+        switch (missing) {
+        case 0: d.read_front = nullptr; break;
+        case 1: d.read_left = nullptr; break;
+        case 2: d.read_right = nullptr; break;
+        case 3: d.read_dust = nullptr; break;
+        case 4: d.write_motor = nullptr; break;
+        default: d.write_cleaner = nullptr; break;
+        }
+        EXPECT_EQ(rvc_create(&d), nullptr) << "missing callback " << missing;
+    }
+    EXPECT_EQ(rvc_initialize(nullptr), RVC_INVALID_ARGUMENT);
+    EXPECT_EQ(rvc_tick(nullptr), RVC_INVALID_ARGUMENT);
+    EXPECT_EQ(rvc_shutdown(nullptr), RVC_INVALID_ARGUMENT);
+    EXPECT_EQ(rvc_report_front(nullptr, true), RVC_INVALID_ARGUMENT);
+    RvcTelemetry t{};
+    EXPECT_EQ(rvc_get_telemetry(nullptr, &t), RVC_INVALID_ARGUMENT);
+    Rvc *robot = rvc_create(&full);
+    ASSERT_NE(robot, nullptr);
+    ASSERT_EQ(rvc_initialize(robot), RVC_OK);
+    EXPECT_EQ(rvc_get_telemetry(robot, nullptr), RVC_INVALID_ARGUMENT);
+    rvc_destroy(robot);
+    rvc_destroy(nullptr); /* NULL 허용 */
+    EXPECT_EQ(dev.log, Outputs({"M:STOP", "C:OFF"})); /* 초기화 외의 명령 없음 */
+}
+
+/* REQ: controller.h "인스턴스별 제어 상태" — 두 로봇의 입력·시간·출력이 섞이지 않는다. */
+TEST(RvcApiEdgeCases, TwoRobotsDoNotShareInputsTimersOrOutputs)
+{
+    FakeDevice a, b;
+    const RvcDevice da = {&a, ReadFront, ReadLeft, ReadRight, ReadDust, WriteMotor, WriteCleaner};
+    const RvcDevice db = {&b, ReadFront, ReadLeft, ReadRight, ReadDust, WriteMotor, WriteCleaner};
+    Rvc *ra = rvc_create(&da);
+    Rvc *rb = rvc_create(&db);
+    ASSERT_NE(ra, nullptr);
+    ASSERT_NE(rb, nullptr);
+    ASSERT_EQ(rvc_initialize(ra), RVC_OK);
+    ASSERT_EQ(rvc_initialize(rb), RVC_OK);
+    a.log.clear();
+    b.log.clear();
+    a.inputs = In(1, 0, 0);
+    ASSERT_EQ(rvc_report_front(ra, true), RVC_OK);   /* A만 앞 막힘 */
+    b.inputs = In(0, 0, 0, 1);                       /* B만 먼지 */
+    for (int tick = 1; tick <= 5; ++tick) {
+        ASSERT_EQ(rvc_tick(ra), RVC_OK);
+        ASSERT_EQ(rvc_tick(rb), RVC_OK);
+    }
+    EXPECT_EQ(a.log, Outputs({"M:RIGHT"}));            /* 1 Tick 진입, 2~5 유지 */
+    EXPECT_EQ(b.log, Outputs({"M:FORWARD", "C:UP"}));  /* 1 Tick 전진, 이후 유지 */
+    rvc_destroy(ra);
+    rvc_destroy(rb);
+}
+
+/* ===================================================================== */
+/* F. 입력 변화 전수·무작위 비교                                           */
+/* ===================================================================== */
+
+/* SpecModel: POL-1~7 문장만으로 만든 기대값 모델. 제품 코드를 호출하지 않는다.
+ * 앞 값은 시스템에 보고된 값(=입력)으로 본다. */
+class SpecModel {
+public:
+    Outputs PowerOn()
+    {
+        mode_ = Mode::Stop;                 /* POL-1 */
+        elapsed_ = 0;
+        hold_ = 0;
+        cleaner_ = "OFF";
+        return {"M:STOP", "C:OFF"};
+    }
+    Outputs Tick(const Sensors &s)
+    {
+        if (mode_ == Mode::Right || mode_ == Mode::Left) {
+            if (++elapsed_ < 5) return {};  /* POL-4: 후속 5번째 Tick에 판단 */
+        } else if (mode_ == Mode::Back) {
+            const bool open = !s.front || !s.left || !s.right;
+            if (++elapsed_ < 3 && !open) return {};  /* POL-5 */
+        }
+        Mode next;
+        if (s.front) {                      /* POL-3 */
+            next = !s.right ? Mode::Right : !s.left ? Mode::Left : Mode::Back;
+            hold_ = 0;                      /* POL-6: 회피 진입 시 취소 */
+        } else {                            /* POL-2, POL-6 */
+            hold_ = s.dust ? 3 : (hold_ > 0 ? hold_ - 1 : 0);
+            next = hold_ > 0 ? Mode::FwdUp : Mode::FwdOn;
+        }
+        Outputs out;                        /* POL-7 */
+        if (next == Mode::Right || next == Mode::Left || next == Mode::Back) {
+            if (cleaner_ != "OFF") {
+                out.push_back("C:OFF");
+                cleaner_ = "OFF";
+            }
+            out.push_back(next == Mode::Right ? "M:RIGHT" : next == Mode::Left ? "M:LEFT" : "M:BACKWARD");
+            elapsed_ = 0;
+        } else {
+            if (mode_ != Mode::FwdOn && mode_ != Mode::FwdUp) out.push_back("M:FORWARD");
+            const std::string target = next == Mode::FwdUp ? "UP" : "ON";
+            if (cleaner_ != target) {
+                out.push_back("C:" + target);
+                cleaner_ = target;
+            }
+        }
+        mode_ = next;
+        return out;
+    }
+
+private:
+    enum class Mode { Stop, FwdOn, FwdUp, Right, Left, Back };
+    Mode mode_ = Mode::Stop;
+    int elapsed_ = 0;
+    int hold_ = 0;
+    std::string cleaner_ = "OFF";
+};
+
+/* 테스트마다 로봇을 새로 만들어 같은 입력을 시스템과 모델에 넣는 실행기. */
+class SequenceRunner {
+public:
+    explicit SequenceRunner(bool report_every_tick) : report_every_tick_(report_every_tick)
+    {
+        const RvcDevice device = {&dev_, ReadFront, ReadLeft, ReadRight, ReadDust, WriteMotor, WriteCleaner};
+        robot_ = rvc_create(&device);
+    }
+    ~SequenceRunner() { rvc_destroy(robot_); }
+    SequenceRunner(const SequenceRunner &) = delete;
+    SequenceRunner &operator=(const SequenceRunner &) = delete;
+
+    /* 초기 입력 + Tick 입력열을 실행하고, 처음 어긋난 지점을 설명으로 돌려준다(일치하면 빈 문자열). */
+    std::string Run(const Sensors &initial, const std::vector<Sensors> &ticks)
+    {
+        SpecModel model;
+        dev_.inputs = initial;
+        reported_ = initial.front;
+        if (!robot_ || rvc_initialize(robot_) != RVC_OK) return "initialize failed";
+        if (Take() != model.PowerOn()) return "initialize outputs differ";
+        for (std::size_t i = 0; i < ticks.size(); ++i) {
+            const Sensors &s = ticks[i];
+            dev_.inputs = s;
+            if (report_every_tick_ || s.front != reported_) {
+                if (rvc_report_front(robot_, s.front) != RVC_OK) return "report failed";
+                reported_ = s.front;
+            }
+            if (rvc_tick(robot_) != RVC_OK) return "tick " + std::to_string(i + 1) + " failed";
+            const Outputs actual = Take();
+            const Outputs expected = model.Tick(s);
+            if (actual != expected)
+                return "tick " + std::to_string(i + 1) + ": expected " + Join(expected) + ", actual " + Join(actual);
+        }
+        return {};
+    }
+
+    static std::string Code(const Sensors &s)
+    {
+        return std::string() + (s.front ? '1' : '0') + (s.left ? '1' : '0') + (s.right ? '1' : '0') +
+               (s.dust ? '1' : '0');
+    }
+    static std::string Describe(const Sensors &initial, const std::vector<Sensors> &ticks)
+    {
+        std::string text = "init " + Code(initial) + " ->";
+        for (const Sensors &s : ticks) text += " " + Code(s);
+        return text;
+    }
+
+private:
+    static std::string Join(const Outputs &o)
+    {
+        if (o.empty()) return "(none)";
+        std::string text;
+        for (const std::string &x : o) text += (text.empty() ? "" : ",") + x;
+        return text;
+    }
+    Outputs Take()
+    {
+        Outputs out;
+        out.swap(dev_.log);
+        return out;
+    }
+    FakeDevice dev_;
+    Rvc *robot_ = nullptr;
+    bool reported_ = false;
+    bool report_every_tick_;
+};
+
+Sensors FromBits(int bits) { return In((bits >> 3) & 1, (bits >> 2) & 1, (bits >> 1) & 1, bits & 1); }
+
+/* 시작 맥락(앞부분 입력열) 뒤에 16가지 입력을 3 Tick 동안 모든 조합으로 넣는다.
+ * 같은 값 유지(이전과 동일)와 값 변화(F/L/R/D 각각 0↔1)가 모두 포함된다. */
+struct ContextCase {
+    const char *name;
+    const char *req;
+    std::vector<Sensors> prefix;
+};
+
+class TransitionCoverageTest : public ::testing::TestWithParam<ContextCase> {};
+
+TEST_P(TransitionCoverageTest, EveryThreeTickContinuationMatchesSpecModel)
+{
+    const ContextCase &c = GetParam();
+    SCOPED_TRACE(c.req);
+    int failures = 0;
+    int runs = 0;
+    for (int a = 0; a < 16 && failures < 5; ++a)
+        for (int b = 0; b < 16 && failures < 5; ++b)
+            for (int d = 0; d < 16 && failures < 5; ++d) {
+                std::vector<Sensors> ticks = c.prefix;
+                ticks.push_back(FromBits(a));
+                ticks.push_back(FromBits(b));
+                ticks.push_back(FromBits(d));
+                SequenceRunner runner(false);
+                const std::string diff = runner.Run(kClear, ticks);
+                ++runs;
+                if (!diff.empty()) {
+                    ++failures;
+                    ADD_FAILURE() << SequenceRunner::Describe(kClear, ticks) << " | " << diff;
+                }
+            }
+    if (failures == 0) EXPECT_EQ(runs, 4096);
+}
+
+// clang-format off
+INSTANTIATE_TEST_SUITE_P(Spec, TransitionCoverageTest, ::testing::Values(
+    ContextCase{"FromStopOff",         "POL-1~7", {}},
+    ContextCase{"FromForwardOn",       "POL-2 POL-7", {In(0,0,0,0)}},
+    ContextCase{"FromBoostT0",         "POL-6", {In(0,0,0,1)}},
+    ContextCase{"FromBoostT2",         "POL-6", {In(0,0,0,1), In(0,0,0,0), In(0,0,0,0)}},
+    ContextCase{"FromRightTurnTick3",  "POL-4", {In(0,0,0,0), In(1,0,0,0), In(0,0,0,0), In(0,0,0,0), In(0,0,0,0)}},
+    ContextCase{"FromLeftTurnTick3",   "POL-4", {In(0,0,0,0), In(1,0,1,0), In(0,0,0,0), In(0,0,0,0), In(0,0,0,0)}},
+    ContextCase{"FromBackwardEntry",   "POL-5", {In(0,0,0,0), In(1,1,1,0)}},
+    ContextCase{"FromBackwardTick1",   "POL-5", {In(0,0,0,0), In(1,1,1,0), In(1,1,1,0)}}),
+    [](const ::testing::TestParamInfo<ContextCase> &info) { return std::string(info.param.name); });
+// clang-format on
+
+/* 초기화 때의 입력 16가지 × 첫 3 Tick 16^3 = 65,536가지 전수. 초기 읽기 값(H-FRONT)과 첫 판단을 모두 덮는다. */
+TEST(SpecModelComparison, EveryInitialInputAndFirstThreeTicks)
+{
+    int failures = 0;
+    for (int init = 0; init < 16 && failures < 5; ++init)
+        for (int a = 0; a < 16 && failures < 5; ++a)
+            for (int b = 0; b < 16 && failures < 5; ++b)
+                for (int d = 0; d < 16 && failures < 5; ++d) {
+                    const std::vector<Sensors> ticks = {FromBits(a), FromBits(b), FromBits(d)};
+                    SequenceRunner runner(false);
+                    const std::string diff = runner.Run(FromBits(init), ticks);
+                    if (!diff.empty()) {
+                        ++failures;
+                        ADD_FAILURE() << SequenceRunner::Describe(FromBits(init), ticks) << " | " << diff;
+                    }
+                }
+}
+
+/* 무작위 장시간 입력: 센서마다 매 Tick 일정 확률로 값이 바뀐다(안 바뀌는 구간과 바뀌는 구간이 섞임).
+ * 시드 고정으로 매번 같은 입력이다. 전방 보고는 "바뀔 때만"과 "매 Tick" 두 방식 모두 검사한다. */
+struct RandomCase {
+    const char *name;
+    double flip_probability;
+    bool report_every_tick;
+};
+
+class RandomSequenceTest : public ::testing::TestWithParam<RandomCase> {};
+
+TEST_P(RandomSequenceTest, LongRandomRunsMatchSpecModel)
+{
+    const RandomCase &c = GetParam();
+    std::mt19937 rng(20261009u);
+    std::bernoulli_distribution flip(c.flip_probability);
+    int failures = 0;
+    for (int run = 0; run < 500 && failures < 5; ++run) {
+        Sensors s = FromBits(static_cast<int>(rng() % 16));
+        const Sensors initial = s;
+        std::vector<Sensors> ticks;
+        for (int t = 0; t < 200; ++t) {
+            if (flip(rng)) s.front = !s.front;
+            if (flip(rng)) s.left = !s.left;
+            if (flip(rng)) s.right = !s.right;
+            if (flip(rng)) s.dust = !s.dust;
+            ticks.push_back(s);
+        }
+        SequenceRunner runner(c.report_every_tick);
+        const std::string diff = runner.Run(initial, ticks);
+        if (!diff.empty()) {
+            ++failures;
+            ADD_FAILURE() << "run " << run << " | " << diff;
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(Spec, RandomSequenceTest,
+                         ::testing::Values(RandomCase{"RareChanges_ReportOnChange", 0.05, false},
+                                           RandomCase{"RareChanges_ReportEveryTick", 0.05, true},
+                                           RandomCase{"FrequentChanges_ReportOnChange", 0.4, false},
+                                           RandomCase{"FrequentChanges_ReportEveryTick", 0.4, true}),
+                         [](const ::testing::TestParamInfo<RandomCase> &info) {
+                             return std::string(info.param.name);
+                         });
 
 }  // namespace
