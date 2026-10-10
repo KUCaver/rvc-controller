@@ -34,7 +34,9 @@
  *       F 입력 변화 전수·무작위 비교(SpecModel = 위 POL 문장만으로 만든 기대값 모델. 제품 코드를 호출하지 않음).
  */
 #include <gtest/gtest.h>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <random>
 #include <sstream>
 #include <string>
@@ -45,6 +47,15 @@ namespace {
 
 /* 장치에 기록된 출력 순서. "M:<모터 명령>" 또는 "C:<청소 명령>". */
 using Outputs = std::vector<std::string>;
+
+/* 출력 목록을 "a,b" 문자열로 만든다(실패 메시지·실행 기록용). */
+std::string Join(const Outputs &o)
+{
+    if (o.empty()) return "(none)";
+    std::string text;
+    for (const std::string &x : o) text += (text.empty() ? "" : ",") + x;
+    return text;
+}
 
 /* 한 Tick에 시스템 경계로 들어오는 센서 입력. true = 장애물 감지 / 먼지 감지. */
 struct Sensors {
@@ -67,6 +78,7 @@ enum DeviceOp { kReadFront, kReadLeft, kReadRight, kReadDust, kWriteMotor, kWrit
 struct FakeDevice {
     Sensors inputs = kClear;
     Outputs log;                    /* 성공한 쓰기만 시간 순서대로 기록 */
+    Outputs attempts;               /* 모든 쓰기 시도와 실패한 읽기를 순서대로 기록. 실패는 "(fail)" 표시 */
     int fail_next[kOpCount] = {};   /* 해당 작업의 다음 N회 호출을 IO_ERROR로 실패시킨다 */
 };
 
@@ -78,9 +90,13 @@ bool ConsumeFault(FakeDevice *d, DeviceOp op)
 }
 RvcStatus ReadInput(void *context, bool *out, DeviceOp op)
 {
+    static const char *const names[] = {"FRONT", "LEFT", "RIGHT", "DUST"};
     auto *d = static_cast<FakeDevice *>(context);
     if (!d || !out) return RVC_INVALID_ARGUMENT;
-    if (ConsumeFault(d, op)) return RVC_IO_ERROR;
+    if (ConsumeFault(d, op)) {
+        d->attempts.push_back(std::string("R:") + names[op] + "(fail)");
+        return RVC_IO_ERROR;
+    }
     switch (op) {
     case kReadFront: *out = d->inputs.front; break;
     case kReadLeft: *out = d->inputs.left; break;
@@ -110,16 +126,26 @@ RvcStatus WriteMotor(void *context, RvcMotorCommand command)
 {
     auto *d = static_cast<FakeDevice *>(context);
     if (!d) return RVC_INVALID_ARGUMENT;
-    if (ConsumeFault(d, kWriteMotor)) return RVC_IO_ERROR;
-    d->log.push_back("M:" + MotorName(command));
+    const std::string entry = "M:" + MotorName(command);
+    if (ConsumeFault(d, kWriteMotor)) {
+        d->attempts.push_back(entry + "(fail)");
+        return RVC_IO_ERROR;
+    }
+    d->attempts.push_back(entry);
+    d->log.push_back(entry);
     return RVC_OK;
 }
 RvcStatus WriteCleaner(void *context, RvcCleanerCommand command)
 {
     auto *d = static_cast<FakeDevice *>(context);
     if (!d) return RVC_INVALID_ARGUMENT;
-    if (ConsumeFault(d, kWriteCleaner)) return RVC_IO_ERROR;
-    d->log.push_back("C:" + CleanerName(command));
+    const std::string entry = "C:" + CleanerName(command);
+    if (ConsumeFault(d, kWriteCleaner)) {
+        d->attempts.push_back(entry + "(fail)");
+        return RVC_IO_ERROR;
+    }
+    d->attempts.push_back(entry);
+    d->log.push_back(entry);
     return RVC_OK;
 }
 
@@ -152,6 +178,13 @@ protected:
     {
         Outputs out;
         out.swap(dev.log);
+        return out;
+    }
+    /* 마지막 조회 이후의 모든 쓰기 시도(실패 포함)와 실패한 읽기를 꺼내고 비운다. */
+    Outputs TakeAttempts()
+    {
+        Outputs out;
+        out.swap(dev.attempts);
         return out;
     }
     /* 전원 투입: 초기 센서값을 두고 initialize. 초기화 중 장치 출력을 반환한다. */
@@ -219,6 +252,7 @@ protected:
             break;
         }
         ASSERT_FALSE(HasFailure()) << "precondition: could not reach start point";
+        dev.attempts.clear();
     }
 };
 
@@ -562,40 +596,55 @@ TEST_F(RvcSystemTest, FrontReportAloneProducesNoOutputUntilNextTick)
     EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:RIGHT"}));
 }
 
-/* 초기화 중 장치 실패. */
+/* 초기화 중 장치 실패. attempts = 실패한 호출까지 포함한 장치 호출 순서(성공한 읽기는 기록하지 않음).
+ * exact=false이면 attempts가 기록의 앞부분과 일치해야 하고, 그 뒤의 호출은 명세에 없어 판정하지 않는다. */
 struct InitFailureCase {
     const char *name;
     DeviceOp op;
+    Outputs attempts;
+    bool exact;
 };
 
 class InitFailureTest : public RvcSystemTest, public ::testing::WithParamInterface<InitFailureCase> {};
 
-/* REQ: H-INIT — 초기화 중 어떤 장치 작업이 실패해도 오류를 반환하고 미준비로 남으며, 재시도하면 정상 동작한다.
- * 실패 시 나머지 초기 명령을 시도하는지와 그때의 장치 출력은 명세에 없어 판정하지 않는다. */
-TEST_P(InitFailureTest, InitializationFailsLocksAndRetryRecovers)
+/* REQ: H-INIT, POL-9 — 초기화 중 장치 작업이 실패해도
+ *  - 쓰기 실패: 초기 명령 STOP → OFF를 순서대로 모두 시도한다(실패한 쪽 포함).
+ *  - 읽기 실패: STOP → OFF 뒤 센서를 읽다 실패하면 OFF → STOP을 다시 시도한다.
+ *  오류를 반환하고 미준비로 남으며, 다시 초기화하면 정상 동작한다. */
+TEST_P(InitFailureTest, InitializationFailureAttemptsOffAndStopInOrderThenRecovers)
 {
-    dev.fail_next[GetParam().op] = 1;
+    const InitFailureCase &c = GetParam();
+    dev.fail_next[c.op] = 1;
     EXPECT_EQ(rvc_initialize(robot), RVC_IO_ERROR);
+    const Outputs attempts = TakeAttempts();
+    std::printf("[ trace    ] init %s attempts: %s\n", c.name, Join(attempts).c_str());
+    if (c.exact) {
+        EXPECT_EQ(attempts, c.attempts);
+    } else {
+        ASSERT_GE(attempts.size(), c.attempts.size()) << Join(attempts);
+        EXPECT_EQ(Outputs(attempts.begin(), attempts.begin() + static_cast<std::ptrdiff_t>(c.attempts.size())),
+                  c.attempts);
+    }
     TakeOutputs();
     ExpectLocked();
     EXPECT_EQ(PowerOn(), Outputs({"M:STOP", "C:OFF"}));
     EXPECT_EQ(Step(kClear), Outputs({"M:FORWARD", "C:ON"}));
 }
 
-INSTANTIATE_TEST_SUITE_P(Spec, InitFailureTest,
-                         ::testing::Values(InitFailureCase{"MotorWrite", kWriteMotor},
-                                           InitFailureCase{"CleanerWrite", kWriteCleaner},
-                                           InitFailureCase{"FrontRead", kReadFront},
-                                           InitFailureCase{"LeftRead", kReadLeft},
-                                           InitFailureCase{"RightRead", kReadRight},
-                                           InitFailureCase{"DustRead", kReadDust}),
-                         [](const ::testing::TestParamInfo<InitFailureCase> &info) {
-                             return std::string(info.param.name);
-                         });
+// clang-format off
+INSTANTIATE_TEST_SUITE_P(Spec, InitFailureTest, ::testing::Values(
+    InitFailureCase{"MotorWrite",   kWriteMotor,   {"M:STOP(fail)", "C:OFF"}, false},
+    InitFailureCase{"CleanerWrite", kWriteCleaner, {"M:STOP", "C:OFF(fail)"}, false},
+    InitFailureCase{"FrontRead",    kReadFront,    {"M:STOP", "C:OFF", "R:FRONT(fail)", "C:OFF", "M:STOP"}, true},
+    InitFailureCase{"LeftRead",     kReadLeft,     {"M:STOP", "C:OFF", "R:LEFT(fail)",  "C:OFF", "M:STOP"}, true},
+    InitFailureCase{"RightRead",    kReadRight,    {"M:STOP", "C:OFF", "R:RIGHT(fail)", "C:OFF", "M:STOP"}, true},
+    InitFailureCase{"DustRead",     kReadDust,     {"M:STOP", "C:OFF", "R:DUST(fail)",  "C:OFF", "M:STOP"}, true}),
+    [](const ::testing::TestParamInfo<InitFailureCase> &info) { return std::string(info.param.name); });
+// clang-format on
 
 class TickReadFailureTest : public RvcSystemTest, public ::testing::WithParamInterface<InitFailureCase> {};
 
-/* REQ: POL-9, H-TICK — Tick 중 센서 읽기 실패: OFF → STOP 시도 후 잠금.
+/* REQ: POL-9, H-TICK — Tick 중 센서 읽기 실패: 실패 직후 OFF → STOP 시도 후 잠금.
  * 전방은 Tick마다 읽지 않으므로(H-FRONT) 주기 센서 세 개만 대상이다. */
 TEST_P(TickReadFailureTest, FailureTurnsOffAndStopsThenLocks)
 {
@@ -603,21 +652,23 @@ TEST_P(TickReadFailureTest, FailureTurnsOffAndStopsThenLocks)
     dev.inputs = kClear;
     dev.fail_next[GetParam().op] = 1;
     EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeAttempts(), GetParam().attempts);
     EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:STOP"}));
     ExpectLocked();
     ExpectLocked();
 }
 
 INSTANTIATE_TEST_SUITE_P(Spec, TickReadFailureTest,
-                         ::testing::Values(InitFailureCase{"Left", kReadLeft},
-                                           InitFailureCase{"Right", kReadRight},
-                                           InitFailureCase{"Dust", kReadDust}),
+                         ::testing::Values(
+                             InitFailureCase{"Left", kReadLeft, {"R:LEFT(fail)", "C:OFF", "M:STOP"}, true},
+                             InitFailureCase{"Right", kReadRight, {"R:RIGHT(fail)", "C:OFF", "M:STOP"}, true},
+                             InitFailureCase{"Dust", kReadDust, {"R:DUST(fail)", "C:OFF", "M:STOP"}, true}),
                          [](const ::testing::TestParamInfo<InitFailureCase> &info) {
                              return std::string(info.param.name);
                          });
 
-/* REQ: POL-9, POL-7 — 회피 진입의 청소 OFF 쓰기가 실패하면 방향 명령은 나가지 않고,
- * 오류 처리로 OFF → STOP을 시도한 뒤 잠긴다. (실패한 쓰기는 장치 기록에 남지 않는다.) */
+/* REQ: POL-9, POL-7 — 회피 진입의 청소 OFF 쓰기가 실패하면 방향 명령은 시도조차 하지 않고,
+ * 오류 처리로 OFF → STOP을 시도한 뒤 잠긴다. */
 TEST_F(RvcSystemTest, CleanerWriteFailureOnAvoidanceNeverTurnsAndLocks)
 {
     ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
@@ -625,6 +676,7 @@ TEST_F(RvcSystemTest, CleanerWriteFailureOnAvoidanceNeverTurnsAndLocks)
     ReportFrontIfChanged(In(1, 0, 0));
     dev.fail_next[kWriteCleaner] = 1;
     EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeAttempts(), Outputs({"C:OFF(fail)", "C:OFF", "M:STOP"}));
     EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:STOP"}));
     ExpectLocked();
 }
@@ -637,7 +689,8 @@ TEST_F(RvcSystemTest, MotorWriteFailureOnAvoidanceTurnsOffAndStopsThenLocks)
     ReportFrontIfChanged(In(1, 0, 0));
     dev.fail_next[kWriteMotor] = 1;
     EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
-    /* 회피용 OFF(성공) → RIGHT(실패, 기록 없음) → 오류 처리 OFF → STOP */
+    /* 회피용 OFF(성공) → RIGHT(실패) → 오류 처리 OFF → STOP */
+    EXPECT_EQ(TakeAttempts(), Outputs({"C:OFF", "M:RIGHT(fail)", "C:OFF", "M:STOP"}));
     EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "C:OFF", "M:STOP"}));
     ExpectLocked();
 }
@@ -787,19 +840,37 @@ TEST_F(RvcSystemTest, TurnExpiryCanSwitchDirection)
     EXPECT_EQ(Step(In(1, 1, 1)), Outputs({"M:BACKWARD"}));
 }
 
-/* REQ: POL-3, POL-7 — 앞이 Tick마다 막힘/열림을 반복해도 회전 유지는 깨지지 않는다. */
-TEST_F(RvcSystemTest, FrontTogglingEveryTickDoesNotBreakTurnHold)
+/* REQ: POL-3, POL-4, POL-7 — 5 Tick 주기로 1,0,1,0,1을 넣으면(만료 Tick마다 앞이 막혀 있음)
+ * 유지 중 값이 바뀌어도 출력이 없고, 만료 Tick마다 RIGHT만 다시 나간다. 마지막에 열리면 전진 복귀. */
+TEST_F(RvcSystemTest, FrontBlockedOnEveryTurnExpiryRetriggersTurn)
 {
     ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
     for (int round = 0; round < 3; ++round) {
         SCOPED_TRACE(round);
+        /* round 0: 회전 진입 / round 1, 2: 회전 만료 Tick(앞 막힘)에 재선택 */
         EXPECT_EQ(Step(In(1, 0, 0)), round == 0 ? Outputs({"C:OFF", "M:RIGHT"}) : Outputs({"M:RIGHT"}));
-        EXPECT_EQ(Step(In(0, 0, 0)), Outputs{});
-        EXPECT_EQ(Step(In(1, 0, 0)), Outputs{});
-        EXPECT_EQ(Step(In(0, 0, 0)), Outputs{});
-        EXPECT_EQ(Step(In(1, 0, 0)), Outputs{});
+        EXPECT_EQ(Step(In(0, 0, 0)), Outputs{});  /* 유지 1 */
+        EXPECT_EQ(Step(In(1, 0, 0)), Outputs{});  /* 유지 2 */
+        EXPECT_EQ(Step(In(0, 0, 0)), Outputs{});  /* 유지 3 */
+        EXPECT_EQ(Step(In(1, 0, 0)), Outputs{});  /* 유지 4 */
     }
-    EXPECT_EQ(Step(kClear), Outputs({"M:FORWARD", "C:ON"}));
+    EXPECT_EQ(Step(kClear), Outputs({"M:FORWARD", "C:ON"}));  /* 만료 Tick, 앞 열림 */
+}
+
+/* REQ: POL-3, POL-4, POL-2, POL-7 — 앞이 매 Tick 1,0,1,0…으로 엄격히 번갈아 바뀌면
+ * 회전 만료 Tick(6번째)은 앞이 열린 Tick이 되어 전진으로 복귀하고, 다음 Tick에 다시 회피한다(6 Tick 주기). */
+TEST_F(RvcSystemTest, FrontAlternatingEveryTickCyclesTurnAndForward)
+{
+    ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        SCOPED_TRACE(cycle);
+        EXPECT_EQ(Step(In(1, 0, 0)), Outputs({"C:OFF", "M:RIGHT"}));  /* 회피 진입 */
+        EXPECT_EQ(Step(In(0, 0, 0)), Outputs{});                      /* 유지 1 */
+        EXPECT_EQ(Step(In(1, 0, 0)), Outputs{});                      /* 유지 2 */
+        EXPECT_EQ(Step(In(0, 0, 0)), Outputs{});                      /* 유지 3 */
+        EXPECT_EQ(Step(In(1, 0, 0)), Outputs{});                      /* 유지 4 */
+        EXPECT_EQ(Step(In(0, 0, 0)), Outputs({"M:FORWARD", "C:ON"})); /* 만료, 앞 열림 */
+    }
 }
 
 /* --- E-4 수명주기 특이 순서 --- */
@@ -844,6 +915,7 @@ TEST_F(RvcSystemTest, ShutdownWithCleanerFailureStillStopsAndReportsError)
     ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
     dev.fail_next[kWriteCleaner] = 1;
     EXPECT_EQ(rvc_shutdown(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeAttempts(), Outputs({"C:OFF(fail)", "M:STOP"}));
     EXPECT_EQ(TakeOutputs(), Outputs({"M:STOP"}));
     ExpectLocked();
 }
@@ -854,6 +926,7 @@ TEST_F(RvcSystemTest, ShutdownWithMotorFailureStillTurnsOffAndReportsError)
     ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
     dev.fail_next[kWriteMotor] = 1;
     EXPECT_EQ(rvc_shutdown(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeAttempts(), Outputs({"C:OFF", "M:STOP(fail)"}));
     EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF"}));
     ExpectLocked();
 }
@@ -877,6 +950,7 @@ TEST_F(RvcSystemTest, PersistentCleanerFailureStillStopsMotor)
     ReportFrontIfChanged(In(1, 0, 0));
     dev.fail_next[kWriteCleaner] = 2;
     EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeAttempts(), Outputs({"C:OFF(fail)", "C:OFF(fail)", "M:STOP"}));
     EXPECT_EQ(TakeOutputs(), Outputs({"M:STOP"}));
     ExpectLocked();
 }
@@ -887,8 +961,10 @@ TEST_F(RvcSystemTest, SensorFailureDuringTurnHoldStopsAndLocks)
     ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardOn));
     ASSERT_EQ(Step(In(1, 0, 0)), Outputs({"C:OFF", "M:RIGHT"}));
     ExpectHold(2, kClear);
+    TakeAttempts();
     dev.fail_next[kReadRight] = 1;
     EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeAttempts(), Outputs({"R:RIGHT(fail)", "C:OFF", "M:STOP"}));
     EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:STOP"}));
     ExpectLocked();
 }
@@ -899,6 +975,7 @@ TEST_F(RvcSystemTest, SensorFailureDuringBackwardStopsAndLocks)
     ASSERT_NO_FATAL_FAILURE(Reach(Start::BackwardTick1));
     dev.fail_next[kReadDust] = 1;
     EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeAttempts(), Outputs({"R:DUST(fail)", "C:OFF", "M:STOP"}));
     EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:STOP"}));
     ExpectLocked();
 }
@@ -910,6 +987,7 @@ TEST_F(RvcSystemTest, BoostWriteFailureStopsAndLocks)
     dev.inputs = In(0, 0, 0, 1);
     dev.fail_next[kWriteCleaner] = 1;
     EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeAttempts(), Outputs({"C:UP(fail)", "C:OFF", "M:STOP"}));
     EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:STOP"}));
     ExpectLocked();
 }
@@ -921,6 +999,7 @@ TEST_F(RvcSystemTest, ForwardWriteFailureStopsAndLocks)
     dev.inputs = kClear;
     dev.fail_next[kWriteMotor] = 1;
     EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeAttempts(), Outputs({"M:FORWARD(fail)", "C:OFF", "M:STOP"}));
     EXPECT_EQ(TakeOutputs(), Outputs({"C:OFF", "M:STOP"}));
     ExpectLocked();
 }
@@ -931,6 +1010,7 @@ TEST_F(RvcSystemTest, RecoveryAfterTickErrorByReinitialization)
     ASSERT_NO_FATAL_FAILURE(Reach(Start::ForwardPower));
     dev.fail_next[kReadLeft] = 1;
     EXPECT_EQ(rvc_tick(robot), RVC_IO_ERROR);
+    EXPECT_EQ(TakeAttempts(), Outputs({"R:LEFT(fail)", "C:OFF", "M:STOP"}));
     TakeOutputs();
     ExpectLocked();
     EXPECT_EQ(PowerOn(), Outputs({"M:STOP", "C:OFF"}));
@@ -943,6 +1023,8 @@ TEST_F(RvcSystemTest, InitializationKeepsFailingWhileFaultPersists)
     dev.fail_next[kReadLeft] = 3;
     for (int i = 0; i < 3; ++i) {
         EXPECT_EQ(rvc_initialize(robot), RVC_IO_ERROR) << "attempt " << i + 1;
+        EXPECT_EQ(TakeAttempts(), Outputs({"M:STOP", "C:OFF", "R:LEFT(fail)", "C:OFF", "M:STOP"}))
+            << "attempt " << i + 1;
         TakeOutputs();
         ExpectLocked();
     }
@@ -1120,13 +1202,6 @@ public:
     }
 
 private:
-    static std::string Join(const Outputs &o)
-    {
-        if (o.empty()) return "(none)";
-        std::string text;
-        for (const std::string &x : o) text += (text.empty() ? "" : ",") + x;
-        return text;
-    }
     Outputs Take()
     {
         Outputs out;
