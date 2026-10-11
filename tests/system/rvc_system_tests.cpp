@@ -28,6 +28,8 @@
  *   H-TICK     rvc_tick: 미초기화 NOT_READY. 장치 오류 시 OFF/STOP 시도, 재초기화 요구
  *   H-FRONT    rvc_report_front: 전방 캐시만 갱신, 명령은 다음 Tick에서 결정.
  *              RvcDevice.read_front는 초기 읽기 전용
+ *   TP-INIT-RETRY (시험 정책) 초기화 중 쓰기 실패 시 STOP → OFF를 한 번씩 시도한 뒤 추가 재시도 없이 잠금.
+ *              명세가 재시도 여부를 정하지 않아 현재 동작을 정책으로 명시함(확정은 구현 담당과 협의)
  * (POL-8 "Controller가 논리 Tick을 관리"는 시간 진행 방식 자체로, 모든 테스트가 따른다.)
  *
  * 구성: A 결정표, B 먼지, C 유지 시간, D 수명주기·오류, E 특이 케이스,
@@ -597,7 +599,9 @@ TEST_F(RvcSystemTest, FrontReportAloneProducesNoOutputUntilNextTick)
 }
 
 /* 초기화 중 장치 실패. attempts = 실패한 호출까지 포함한 장치 호출 순서(성공한 읽기는 기록하지 않음).
- * exact=false이면 attempts가 기록의 앞부분과 일치해야 하고, 그 뒤의 호출은 명세에 없어 판정하지 않는다. */
+ * exact=false이면 attempts가 기록의 앞부분과 일치해야 한다(현재 모든 사례는 exact=true).
+ * 시험 정책 TP-INIT-RETRY: 초기화 중 쓰기가 실패하면 STOP → OFF를 각각 한 번씩 시도한 뒤 추가 재시도 없이
+ * 미준비로 잠근다. 명세(H-INIT, POL-9)는 재시도 여부를 정하지 않아 현재 동작을 시험 정책으로 명시했다. */
 struct InitFailureCase {
     const char *name;
     DeviceOp op;
@@ -607,8 +611,8 @@ struct InitFailureCase {
 
 class InitFailureTest : public RvcSystemTest, public ::testing::WithParamInterface<InitFailureCase> {};
 
-/* REQ: H-INIT, POL-9 — 초기화 중 장치 작업이 실패해도
- *  - 쓰기 실패: 초기 명령 STOP → OFF를 순서대로 모두 시도한다(실패한 쪽 포함).
+/* REQ: H-INIT, POL-9, TP-INIT-RETRY — 초기화 중 장치 작업이 실패해도
+ *  - 쓰기 실패: 초기 명령 STOP → OFF를 순서대로 한 번씩 시도하고(실패한 쪽 포함) 추가 재시도는 없다.
  *  - 읽기 실패: STOP → OFF 뒤 센서를 읽다 실패하면 OFF → STOP을 다시 시도한다.
  *  오류를 반환하고 미준비로 남으며, 다시 초기화하면 정상 동작한다. */
 TEST_P(InitFailureTest, InitializationFailureAttemptsOffAndStopInOrderThenRecovers)
@@ -633,8 +637,8 @@ TEST_P(InitFailureTest, InitializationFailureAttemptsOffAndStopInOrderThenRecove
 
 // clang-format off
 INSTANTIATE_TEST_SUITE_P(Spec, InitFailureTest, ::testing::Values(
-    InitFailureCase{"MotorWrite",   kWriteMotor,   {"M:STOP(fail)", "C:OFF"}, false},
-    InitFailureCase{"CleanerWrite", kWriteCleaner, {"M:STOP", "C:OFF(fail)"}, false},
+    InitFailureCase{"MotorWrite",   kWriteMotor,   {"M:STOP(fail)", "C:OFF"}, true},
+    InitFailureCase{"CleanerWrite", kWriteCleaner, {"M:STOP", "C:OFF(fail)"}, true},
     InitFailureCase{"FrontRead",    kReadFront,    {"M:STOP", "C:OFF", "R:FRONT(fail)", "C:OFF", "M:STOP"}, true},
     InitFailureCase{"LeftRead",     kReadLeft,     {"M:STOP", "C:OFF", "R:LEFT(fail)",  "C:OFF", "M:STOP"}, true},
     InitFailureCase{"RightRead",    kReadRight,    {"M:STOP", "C:OFF", "R:RIGHT(fail)", "C:OFF", "M:STOP"}, true},
@@ -1247,7 +1251,9 @@ TEST_P(TransitionCoverageTest, EveryThreeTickContinuationMatchesSpecModel)
                     ADD_FAILURE() << SequenceRunner::Describe(kClear, ticks) << " | " << diff;
                 }
             }
-    if (failures == 0) EXPECT_EQ(runs, 4096);
+    if (failures == 0) {
+        EXPECT_EQ(runs, 4096);
+    }
 }
 
 // clang-format off

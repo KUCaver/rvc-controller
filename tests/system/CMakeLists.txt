@@ -25,10 +25,18 @@ FetchContent_MakeAvailable(googletest)
 
 set(RVC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
+# Compile a copy of the product files from the build tree. A source outside this
+# project would make CMake mirror its absolute path into the object path, which
+# MinGW GCC cannot create when the checkout path has non-ASCII characters.
+# configure_file re-copies (and reconfigures) whenever the originals change.
+set(RVC_SRC_COPY "${CMAKE_CURRENT_BINARY_DIR}/rvc_src")
+configure_file("${RVC_ROOT}/controller.c" "${RVC_SRC_COPY}/controller.c" COPYONLY)
+configure_file("${RVC_ROOT}/controller.h" "${RVC_SRC_COPY}/controller.h" COPYONLY)
+
 # Control modules only: RVC_NO_MAIN drops the CLI and the built-in mock device.
-add_library(rvc_controller STATIC "${RVC_ROOT}/controller.c")
+add_library(rvc_controller STATIC "${RVC_SRC_COPY}/controller.c")
 target_compile_definitions(rvc_controller PRIVATE RVC_NO_MAIN)
-target_include_directories(rvc_controller PUBLIC "${RVC_ROOT}")
+target_include_directories(rvc_controller PUBLIC "${RVC_SRC_COPY}")
 
 add_executable(rvc_system_tests rvc_system_tests.cpp)
 target_link_libraries(rvc_system_tests PRIVATE rvc_controller GTest::gtest_main)
